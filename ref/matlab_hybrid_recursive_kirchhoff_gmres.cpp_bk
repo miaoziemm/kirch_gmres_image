@@ -1,0 +1,1194 @@
+// Four-block recursive FMM/Kirchhoff initial field followed by the unchanged
+// global ray-phase coarse correction and GMRES experiment from
+// matlab_hybrid_rayphase_gmres.cpp.
+//
+// Important implementation facts:
+//   * The original translation is included, not edited. Its main is renamed so
+//     that its tested Helmholtz, coarse-space, GMRES, reference, and I/O
+//     routines remain the single numerical implementation used here.
+//   * Traveltimes are computed by the repository efmm solver for every datum
+//     source. No straight-ray or Euclidean traveltime substitute is used.
+//   * The simplified one-way Kirchhoff kernel is the same phase/filter form as
+//     OneWayKernelData in SERECKIRCH/src/huygens_sweep.cpp.
+//   * Matrix-vector products use the repository's actual multi-level
+//     bf1d_strict_segmented_* butterfly factorization. They are checked against
+//     direct dense summation at three depths per propagated block.
+//   * The first block is the locally valid primary-source field, as in the
+//     Luo-Qian-Burridge Huygens sweep. Blocks 2-4 are recursive integrations.
+//   * Each recursive target includes the shared rows in the preceding block;
+//     those rows determine a complex least-squares fit and a linear cross-fade
+//     before the propagated field is accepted in the new block.
+
+#define main matlab_hybrid_rayphase_gmres_original_main
+#include "matlab_hybrid_rayphase_gmres.cpp"
+#undef main
+
+#include <SERECKIRCH/include/bf1d.h>
+#include <SERECKIRCH/include/efmm.h>
+
+#include <array>
+#include <atomic>
+#include <mutex>
+#include <set>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace {
+
+using ComplexF = std::complex<float>;
+
+struct RecursiveSettings {
+    int block_count = 4;
+    int overlap_rows = 20;
+    int threads = 0;
+    int bf_p = 12;
+    int bf_leaf = 16;
+    int bf_panel_levels = 1;
+    float bf_amp_eps = 1.0e-20f;
+    float bf_phase_tol = 0.5f;
+    float filter_dt = 0.001f;
+    float filter_length = 0.025f;
+    int filter_lookup_subsamples = 32;
+    bool validate_direct = true;
+    bool save_fmm_samples = true;
+    std::string reference_real;
+    std::string reference_imag;
+};
+
+struct FmmModel {
+    int nx = 0;
+    int nz = 0;
+    float dx = 1.0f;
+    float dz = 1.0f;
+    std::vector<float> velocity; // x-fast: ix + iz*nx
+
+    std::size_t index(int ix, int iz) const
+    {
+        return static_cast<std::size_t>(ix) +
+               static_cast<std::size_t>(iz) * nx;
+    }
+};
+
+struct RecursiveBlock {
+    int id = 0;
+    int output_start_iz = 0;
+    int output_end_iz = 0;
+    int datum_iz = 0;
+
+    int integration_start_iz() const
+    {
+        return id == 0 ? output_start_iz : datum_iz + 1;
+    }
+
+    int integration_depth_count() const
+    {
+        return output_end_iz - integration_start_iz() + 1;
+    }
+};
+
+struct BlockMetric {
+    RecursiveBlock block;
+    int fmm_sources = 0;
+    double table_megabytes = 0.0;
+    double fmm_seconds = 0.0;
+    double butterfly_build_seconds = 0.0;
+    double butterfly_apply_seconds = 0.0;
+    double direct_check_seconds = 0.0;
+    double direct_relative_error = 0.0;
+    ComplexF overlap_scale = ComplexF(1.0f, 0.0f);
+    double overlap_mismatch_before = 0.0;
+    double overlap_mismatch_after = 0.0;
+    float minimum_traveltime = 0.0f;
+    float maximum_traveltime = 0.0f;
+};
+
+struct RecursiveResult {
+    std::vector<ComplexF> one_way_field;
+    std::vector<std::vector<ComplexF>> block_snapshots;
+    std::vector<double> primary_traveltime;
+    std::vector<std::vector<double>> datum_middle_source_traveltimes;
+    std::vector<BlockMetric> block_metrics;
+    double primary_fmm_seconds = 0.0;
+    double total_seconds = 0.0;
+};
+
+void print_recursive_help()
+{
+    std::cout
+        << "Four-block recursive FMM + bf1d Kirchhoff + global GMRES\n\n"
+        << "Required:\n"
+        << "  model=FILE        smoothed raw float32 model in MATLAB [nz,nx] order\n\n"
+        << "Defaults retained from matlab_hybrid_rayphase_gmres:\n"
+        << "  nx=1024 nz=298 dx=10.5 dz=10.5 frequency=15 sx=513 sz=31\n"
+        << "  nabs=25 q_coarse=2 gmres_steps_per_outer=3 target_relres=0.05\n\n"
+        << "Recursive Kirchhoff defaults:\n"
+        << "  block_count=4 overlap_rows=20 threads=0\n"
+        << "  bf_p=12 bf_leaf=16 bf_panel_levels=1 bf_phase_tol=0.5\n"
+        << "  filter_dt=0.001 filter_length=0.025 filter_lookup_subsamples=32\n"
+        << "  validate_direct=1 save_fmm_samples=1\n\n"
+        << "Reference:\n"
+        << "  reference_real=FILE reference_imag=FILE  split float32 reference\n"
+        << "  or use reference_mode=direct|read|none from the original program\n";
+}
+
+RecursiveSettings parse_recursive_settings(const Arguments& arguments)
+{
+    RecursiveSettings settings;
+    settings.block_count = arguments.get_int("block_count", settings.block_count);
+    settings.overlap_rows = arguments.get_int("overlap_rows", settings.overlap_rows);
+    settings.threads = arguments.get_int("threads", settings.threads);
+    settings.bf_p = arguments.get_int("bf_p", settings.bf_p);
+    settings.bf_leaf = arguments.get_int("bf_leaf", settings.bf_leaf);
+    settings.bf_panel_levels = arguments.get_int(
+        "bf_panel_levels", settings.bf_panel_levels);
+    settings.bf_amp_eps = static_cast<float>(arguments.get_double(
+        "bf_amp_eps", settings.bf_amp_eps));
+    settings.bf_phase_tol = static_cast<float>(arguments.get_double(
+        "bf_phase_tol", settings.bf_phase_tol));
+    settings.filter_dt = static_cast<float>(arguments.get_double(
+        "filter_dt", settings.filter_dt));
+    settings.filter_length = static_cast<float>(arguments.get_double(
+        "filter_length", settings.filter_length));
+    settings.filter_lookup_subsamples = arguments.get_int(
+        "filter_lookup_subsamples", settings.filter_lookup_subsamples);
+    settings.validate_direct = arguments.get_bool(
+        "validate_direct", settings.validate_direct);
+    settings.save_fmm_samples = arguments.get_bool(
+        "save_fmm_samples", settings.save_fmm_samples);
+    settings.reference_real = arguments.get("reference_real", "");
+    settings.reference_imag = arguments.get("reference_imag", "");
+
+    if (settings.block_count != 4) {
+        throw std::invalid_argument(
+            "block_count must be exactly 4 for this controlled experiment");
+    }
+    if (settings.overlap_rows < 1 || settings.threads < 0 ||
+        settings.bf_p < 2 || settings.bf_leaf < 4 ||
+        settings.bf_p >= settings.bf_leaf || settings.bf_panel_levels < 0 ||
+        !(settings.bf_phase_tol > 0.0f) || settings.bf_amp_eps < 0.0f ||
+        !(settings.filter_dt > 0.0f) || !(settings.filter_length > 0.0f) ||
+        settings.filter_lookup_subsamples < 1) {
+        throw std::invalid_argument("invalid recursive FMM/butterfly parameters");
+    }
+    if (settings.reference_real.empty() != settings.reference_imag.empty()) {
+        throw std::invalid_argument(
+            "reference_real and reference_imag must be supplied together");
+    }
+    return settings;
+}
+
+FmmModel make_fmm_model(const Model& model, const Parameters& p)
+{
+    FmmModel output;
+    output.nx = model.nx;
+    output.nz = model.nz;
+    output.dx = static_cast<float>(p.dx);
+    output.dz = static_cast<float>(p.dz);
+    output.velocity.resize(static_cast<std::size_t>(model.nx) * model.nz);
+    for (int iz = 0; iz < model.nz; ++iz) {
+        for (int ix = 0; ix < model.nx; ++ix) {
+            output.velocity[output.index(ix, iz)] = static_cast<float>(
+                model.velocity[model.index(iz, ix)]);
+        }
+    }
+    return output;
+}
+
+std::vector<RecursiveBlock> make_four_blocks(const FmmModel& model,
+                                             int source_z,
+                                             int overlap_rows)
+{
+    if (model.nz < 16 || source_z < 0 || source_z >= model.nz) {
+        throw std::invalid_argument("invalid grid/source for four-block split");
+    }
+    std::vector<RecursiveBlock> blocks(4);
+    for (int id = 0; id < 4; ++id) {
+        RecursiveBlock block;
+        block.id = id;
+        block.output_start_iz = static_cast<int>(
+            (static_cast<long long>(id) * model.nz) / 4);
+        block.output_end_iz = static_cast<int>(
+            (static_cast<long long>(id + 1) * model.nz) / 4) - 1;
+        if (id == 3) block.output_end_iz = model.nz - 1;
+        block.datum_iz = id == 0
+            ? source_z
+            : block.output_start_iz - overlap_rows;
+        if (id > 0 && (block.datum_iz < 1 ||
+                       block.datum_iz >= block.output_start_iz ||
+                       block.datum_iz > blocks[static_cast<std::size_t>(id - 1)].output_end_iz)) {
+            throw std::invalid_argument(
+                "overlap_rows does not place the datum inside the preceding block");
+        }
+        blocks[static_cast<std::size_t>(id)] = block;
+    }
+    if (source_z > blocks.front().output_end_iz) {
+        throw std::invalid_argument("source lies below the first block");
+    }
+    if (blocks[1].datum_iz <= source_z) {
+        throw std::invalid_argument(
+            "the first recursive datum must be below the physical source; "
+            "reduce overlap_rows or enlarge the vertical crop");
+    }
+    return blocks;
+}
+
+std::vector<float> solve_repository_fmm(const FmmModel& model,
+                                        int source_x,
+                                        int source_z)
+{
+    if (source_x < 0 || source_x >= model.nx ||
+        source_z < 0 || source_z >= model.nz) {
+        throw std::invalid_argument("FMM source is outside the active model");
+    }
+    efmm_t solver{};
+    if (efmm_init(&solver, model.nx, model.nz, model.dx, model.dz,
+                  source_x * model.dx, source_z * model.dz) != 0) {
+        throw std::runtime_error("efmm_init failed");
+    }
+    try {
+        if (efmm_set_vel(&solver, const_cast<float*>(model.velocity.data())) != 0) {
+            throw std::runtime_error("efmm_set_vel failed");
+        }
+        const int status = efmm_solver(&solver);
+        if (status != 0) {
+            throw std::runtime_error(
+                "efmm_solver failed with status " + std::to_string(status));
+        }
+        const std::size_t count = static_cast<std::size_t>(model.nx) * model.nz;
+        std::vector<float> traveltime(solver.tt, solver.tt + count);
+        efmm_free(&solver);
+        return traveltime;
+    } catch (...) {
+        efmm_free(&solver);
+        throw;
+    }
+}
+
+std::vector<double> fmm_to_matlab_order(const FmmModel& model,
+                                        const std::vector<float>& input)
+{
+    std::vector<double> output(input.size());
+    for (int ix = 0; ix < model.nx; ++ix) {
+        for (int iz = 0; iz < model.nz; ++iz) {
+            output[static_cast<std::size_t>(iz) +
+                   static_cast<std::size_t>(ix) * model.nz] =
+                input[model.index(ix, iz)];
+        }
+    }
+    return output;
+}
+
+class SimplifiedKirchhoffFilter {
+public:
+    SimplifiedKirchhoffFilter(float frequency,
+                              float sample_interval,
+                              float filter_length,
+                              float maximum_traveltime,
+                              int lookup_subsamples)
+        : frequency_(frequency),
+          sample_interval_(sample_interval),
+          filter_length_(filter_length),
+          omega_(2.0f * static_cast<float>(kPi) * frequency)
+    {
+        if (!(frequency_ > 0.0f) || !(sample_interval_ > 0.0f) ||
+            !(filter_length_ > 0.0f) || !(maximum_traveltime > 0.0f) ||
+            lookup_subsamples < 1) {
+            throw std::invalid_argument("invalid Kirchhoff filter parameters");
+        }
+        lookup_step_ = sample_interval_ / lookup_subsamples;
+        const std::size_t count = static_cast<std::size_t>(
+            std::ceil(maximum_traveltime / lookup_step_)) + 2;
+        lookup_.resize(count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (long long i = 0; i < static_cast<long long>(count); ++i) {
+            const float tau = std::max(
+                lookup_step_ * static_cast<float>(i),
+                0.25f * sample_interval_);
+            lookup_[static_cast<std::size_t>(i)] = exact_response(tau);
+        }
+    }
+
+    ComplexF response(float tau) const
+    {
+        if (!(tau > 0.0f) || !std::isfinite(tau)) return ComplexF(0.0f, 0.0f);
+        const float coordinate = tau / lookup_step_;
+        if (coordinate <= 0.0f) return lookup_.front();
+        const std::size_t left = static_cast<std::size_t>(coordinate);
+        if (left + 1 >= lookup_.size()) return lookup_.back();
+        const float fraction = coordinate - static_cast<float>(left);
+        return (1.0f - fraction) * lookup_[left] +
+               fraction * lookup_[left + 1];
+    }
+
+    float omega() const { return omega_; }
+
+private:
+    ComplexF exact_response(float tau) const
+    {
+        const int nsam = static_cast<int>(filter_length_ / sample_interval_) + 2;
+        std::vector<float> coefficients(static_cast<std::size_t>(nsam - 1), 0.0f);
+        float previous2 = 0.0f;
+        float previous1 = std::sqrt(
+            ((tau + sample_interval_) / tau) *
+            ((tau + sample_interval_) / tau) - 1.0f);
+        coefficients[0] = previous1;
+        for (int k = 1; k < nsam - 1; ++k) {
+            const float t =
+                (tau + static_cast<float>(k + 1) * sample_interval_) / tau;
+            const float current = std::sqrt(t * t - 1.0f);
+            coefficients[static_cast<std::size_t>(k)] =
+                current - 2.0f * previous1 + previous2;
+            previous2 = previous1;
+            previous1 = current;
+        }
+        const float digital_omega = omega_ * sample_interval_;
+        const ComplexF step = std::exp(ComplexF(0.0f, -digital_omega));
+        ComplexF power(1.0f, 0.0f);
+        ComplexF sum(0.0f, 0.0f);
+        for (int k = 0; k <= nsam - 2; ++k) {
+            sum += (coefficients[static_cast<std::size_t>(k)] /
+                    sample_interval_) * power;
+            power *= step;
+        }
+        const float q = tau / sample_interval_;
+        const int m = static_cast<int>(std::ceil(q));
+        const float delta = static_cast<float>(m) - q;
+        const ComplexF linear_delay =
+            (1.0f - delta) * std::exp(ComplexF(
+                0.0f, -digital_omega * static_cast<float>(m))) +
+            delta * std::exp(ComplexF(
+                0.0f, -digital_omega * static_cast<float>(m - 1)));
+        return linear_delay * sum;
+    }
+
+    float frequency_ = 0.0f;
+    float sample_interval_ = 0.001f;
+    float filter_length_ = 0.025f;
+    float lookup_step_ = 0.0f;
+    float omega_ = 0.0f;
+    std::vector<ComplexF> lookup_;
+};
+
+std::size_t travel_table_index(int source,
+                               int target_x,
+                               int local_z,
+                               int nx,
+                               int depth_count)
+{
+    return (static_cast<std::size_t>(source) * nx + target_x) *
+               depth_count + local_z;
+}
+
+struct TravelTable {
+    int nx = 0;
+    int depth_count = 0;
+    std::vector<float> values;
+    std::vector<float> middle_source_full_field;
+    double seconds = 0.0;
+    float minimum = 0.0f;
+    float maximum = 0.0f;
+};
+
+TravelTable build_true_fmm_table(const FmmModel& model,
+                                 const RecursiveBlock& block,
+                                 int requested_threads)
+{
+    TravelTable table;
+    table.nx = model.nx;
+    table.depth_count = block.integration_depth_count();
+    table.values.resize(
+        static_cast<std::size_t>(model.nx) * model.nx * table.depth_count);
+    const auto started = Clock::now();
+    std::atomic<int> completed{0};
+    std::atomic<bool> failed{false};
+    std::mutex failure_mutex;
+    std::string failure_message;
+    const int workers = requested_threads > 0 ? requested_threads :
+#ifdef _OPENMP
+        omp_get_max_threads();
+#else
+        1;
+#endif
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#endif
+    for (int source = 0; source < model.nx; ++source) {
+        if (failed.load(std::memory_order_relaxed)) continue;
+        try {
+            const std::vector<float> tau = solve_repository_fmm(
+                model, source, block.datum_iz);
+            for (int target_x = 0; target_x < model.nx; ++target_x) {
+                for (int local_z = 0; local_z < table.depth_count; ++local_z) {
+                    const int target_z = block.integration_start_iz() + local_z;
+                    table.values[travel_table_index(
+                        source, target_x, local_z,
+                        model.nx, table.depth_count)] =
+                        std::max(tau[model.index(target_x, target_z)], 1.0e-8f);
+                }
+            }
+            if (source == model.nx / 2) table.middle_source_full_field = tau;
+            const int done = completed.fetch_add(1) + 1;
+            if (done == model.nx || done % std::max(1, model.nx / 8) == 0) {
+#ifdef _OPENMP
+#pragma omp critical(recursive_fmm_progress)
+#endif
+                std::cout << "    FMM sources " << done << '/' << model.nx << '\n';
+            }
+        } catch (const std::exception& error) {
+            bool expected = false;
+            if (failed.compare_exchange_strong(expected, true)) {
+                std::lock_guard<std::mutex> lock(failure_mutex);
+                failure_message = error.what();
+            }
+        }
+    }
+    if (failed.load()) {
+        throw std::runtime_error("parallel FMM table failed: " + failure_message);
+    }
+    table.seconds = elapsed_seconds(started);
+    const auto range = std::minmax_element(table.values.begin(), table.values.end());
+    table.minimum = *range.first;
+    table.maximum = *range.second;
+    return table;
+}
+
+ComplexF simplified_kernel_entry(const FmmModel& model,
+                                 const RecursiveBlock& block,
+                                 const TravelTable& table,
+                                 const SimplifiedKirchhoffFilter& filter,
+                                 int target_x,
+                                 int source_x,
+                                 int local_z)
+{
+    const float tau = table.values[travel_table_index(
+        source_x, target_x, local_z, model.nx, table.depth_count)];
+    const float horizontal = (target_x - source_x) * model.dx;
+    const float vertical =
+        (block.integration_start_iz() + local_z - block.datum_iz) * model.dz;
+    const float distance_squared = horizontal * horizontal + vertical * vertical;
+    const float geometry = vertical * tau /
+        (static_cast<float>(kPi) * std::max(distance_squared, 1.0e-20f));
+    const float quadrature =
+        (source_x == 0 || source_x == model.nx - 1)
+            ? 0.5f * model.dx
+            : model.dx;
+    return quadrature * geometry * filter.response(tau);
+}
+
+struct FactorDeleterRecursive {
+    void operator()(BFStrictSegmentedFactor* factor) const
+    {
+        bf1d_strict_segmented_destroy(factor);
+    }
+};
+
+using RecursiveFactor =
+    std::unique_ptr<BFStrictSegmentedFactor, FactorDeleterRecursive>;
+
+BlockMetric propagate_block_with_butterfly(
+    const FmmModel& model,
+    const RecursiveBlock& block,
+    const RecursiveSettings& settings,
+    const TravelTable& table,
+    float frequency,
+    std::vector<ComplexF>& wavefield)
+{
+    BlockMetric metric;
+    metric.block = block;
+    metric.fmm_sources = model.nx;
+    metric.table_megabytes =
+        table.values.size() * sizeof(float) / 1.0e6;
+    metric.fmm_seconds = table.seconds;
+    metric.minimum_traveltime = table.minimum;
+    metric.maximum_traveltime = table.maximum;
+
+    const SimplifiedKirchhoffFilter filter(
+        frequency, settings.filter_dt, settings.filter_length,
+        table.maximum, settings.filter_lookup_subsamples);
+    const int depths = table.depth_count;
+    std::vector<RecursiveFactor> factors(static_cast<std::size_t>(depths));
+    std::atomic<bool> failed{false};
+    const int workers = settings.threads > 0 ? settings.threads :
+#ifdef _OPENMP
+        omp_get_max_threads();
+#else
+        1;
+#endif
+
+    auto started = Clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#endif
+    for (int local_z = 0; local_z < depths; ++local_z) {
+        if (failed.load(std::memory_order_relaxed)) continue;
+        std::vector<float> tau_storage(
+            static_cast<std::size_t>(model.nx) * model.nx);
+        std::vector<float*> tau_rows(static_cast<std::size_t>(model.nx));
+        std::vector<float> amplitude(
+            2 * static_cast<std::size_t>(model.nx) * model.nx);
+        for (int target_x = 0; target_x < model.nx; ++target_x) {
+            tau_rows[static_cast<std::size_t>(target_x)] =
+                tau_storage.data() + static_cast<std::size_t>(target_x) * model.nx;
+            for (int source_x = 0; source_x < model.nx; ++source_x) {
+                const std::size_t matrix_index =
+                    static_cast<std::size_t>(target_x) * model.nx + source_x;
+                const float tau = table.values[travel_table_index(
+                    source_x, target_x, local_z, model.nx, depths)];
+                tau_storage[matrix_index] = tau;
+                const ComplexF entry = simplified_kernel_entry(
+                    model, block, table, filter,
+                    target_x, source_x, local_z);
+                const ComplexF phase_removed = entry * std::exp(
+                    ComplexF(0.0f, filter.omega() * tau));
+                amplitude[2 * matrix_index] = phase_removed.real();
+                amplitude[2 * matrix_index + 1] = phase_removed.imag();
+            }
+        }
+        BFStrictSegmentedFactor* factor =
+            bf1d_strict_segmented_create_phase_amp(
+                model.nx, tau_rows.data(),
+                reinterpret_cast<const fftwf_complex*>(amplitude.data()),
+                filter.omega(), settings.bf_p, settings.bf_leaf,
+                settings.bf_panel_levels, settings.bf_amp_eps,
+                settings.bf_phase_tol);
+        if (factor == nullptr) {
+            failed.store(true);
+        } else {
+            factors[static_cast<std::size_t>(local_z)].reset(factor);
+        }
+    }
+    if (failed.load()) {
+        throw std::runtime_error("bf1d factor construction returned null");
+    }
+    metric.butterfly_build_seconds = elapsed_seconds(started);
+
+    std::vector<float> packed_input(2 * static_cast<std::size_t>(model.nx));
+    for (int source_x = 0; source_x < model.nx; ++source_x) {
+        const ComplexF value = wavefield[model.index(source_x, block.datum_iz)];
+        packed_input[2 * static_cast<std::size_t>(source_x)] = value.real();
+        packed_input[2 * static_cast<std::size_t>(source_x) + 1] = value.imag();
+    }
+    std::vector<ComplexF> target_values(
+        static_cast<std::size_t>(model.nx) * depths);
+    started = Clock::now();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#endif
+    for (int local_z = 0; local_z < depths; ++local_z) {
+        std::vector<float> output(2 * static_cast<std::size_t>(model.nx));
+        bf1d_strict_segmented_apply(
+            factors[static_cast<std::size_t>(local_z)].get(),
+            reinterpret_cast<const fftwf_complex*>(packed_input.data()),
+            reinterpret_cast<fftwf_complex*>(output.data()));
+        for (int target_x = 0; target_x < model.nx; ++target_x) {
+            target_values[static_cast<std::size_t>(target_x) * depths + local_z] =
+                ComplexF(output[2 * static_cast<std::size_t>(target_x)],
+                         output[2 * static_cast<std::size_t>(target_x) + 1]);
+        }
+    }
+    metric.butterfly_apply_seconds = elapsed_seconds(started);
+
+    if (settings.validate_direct) {
+        started = Clock::now();
+        const std::set<int> checked_depths = {0, depths / 2, depths - 1};
+        long double numerator = 0.0;
+        long double denominator = 0.0;
+        for (int local_z : checked_depths) {
+            std::vector<ComplexF> direct(static_cast<std::size_t>(model.nx));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(workers)
+#endif
+            for (int target_x = 0; target_x < model.nx; ++target_x) {
+                ComplexF sum(0.0f, 0.0f);
+                for (int source_x = 0; source_x < model.nx; ++source_x) {
+                    const ComplexF input(
+                        packed_input[2 * static_cast<std::size_t>(source_x)],
+                        packed_input[2 * static_cast<std::size_t>(source_x) + 1]);
+                    sum += simplified_kernel_entry(
+                        model, block, table, filter,
+                        target_x, source_x, local_z) * input;
+                }
+                direct[static_cast<std::size_t>(target_x)] = sum;
+            }
+            for (int target_x = 0; target_x < model.nx; ++target_x) {
+                const ComplexF bf = target_values[
+                    static_cast<std::size_t>(target_x) * depths + local_z];
+                const ComplexF exact = direct[static_cast<std::size_t>(target_x)];
+                numerator += std::norm(bf - exact);
+                denominator += std::norm(exact);
+            }
+        }
+        metric.direct_relative_error = denominator > 0.0
+            ? std::sqrt(static_cast<double>(numerator / denominator))
+            : 0.0;
+        metric.direct_check_seconds = elapsed_seconds(started);
+    }
+
+    // The integration target includes the rows shared with the preceding
+    // block.  Use those independently computed values to estimate one complex
+    // block scale, then cross-fade through the overlap before accepting the
+    // recursively propagated values in the new output rows.  The datum itself
+    // is shared exactly and is excluded from the target matrix because the
+    // value-only kernel is singular at zero vertical separation.
+    const int overlap_depths =
+        block.output_start_iz - block.integration_start_iz();
+    if (overlap_depths > 0) {
+        std::complex<long double> numerator(0.0L, 0.0L);
+        long double denominator = 0.0;
+        long double existing_energy = 0.0;
+        long double mismatch_before = 0.0;
+        for (int target_x = 0; target_x < model.nx; ++target_x) {
+            for (int local_z = 0; local_z < overlap_depths; ++local_z) {
+                const ComplexF computed = target_values[
+                    static_cast<std::size_t>(target_x) * depths + local_z];
+                const ComplexF existing = wavefield[model.index(
+                    target_x, block.integration_start_iz() + local_z)];
+                numerator += std::conj(std::complex<long double>(computed)) *
+                    std::complex<long double>(existing);
+                denominator += std::norm(computed);
+                existing_energy += std::norm(existing);
+                mismatch_before += std::norm(computed - existing);
+            }
+        }
+        if (denominator > 0.0) {
+            const std::complex<long double> fitted = numerator / denominator;
+            metric.overlap_scale = ComplexF(
+                static_cast<float>(fitted.real()),
+                static_cast<float>(fitted.imag()));
+        }
+        long double mismatch_after = 0.0;
+        for (int target_x = 0; target_x < model.nx; ++target_x) {
+            for (int local_z = 0; local_z < overlap_depths; ++local_z) {
+                const ComplexF computed = metric.overlap_scale * target_values[
+                    static_cast<std::size_t>(target_x) * depths + local_z];
+                const ComplexF existing = wavefield[model.index(
+                    target_x, block.integration_start_iz() + local_z)];
+                mismatch_after += std::norm(computed - existing);
+            }
+        }
+        if (existing_energy > 0.0) {
+            metric.overlap_mismatch_before = std::sqrt(
+                static_cast<double>(mismatch_before / existing_energy));
+            metric.overlap_mismatch_after = std::sqrt(
+                static_cast<double>(mismatch_after / existing_energy));
+        }
+    }
+
+    for (int target_x = 0; target_x < model.nx; ++target_x) {
+        for (int local_z = 0; local_z < depths; ++local_z) {
+            const int target_z = block.integration_start_iz() + local_z;
+            const ComplexF propagated = metric.overlap_scale * target_values[
+                static_cast<std::size_t>(target_x) * depths + local_z];
+            if (target_z < block.output_start_iz) {
+                const float weight = static_cast<float>(
+                    target_z - block.datum_iz) /
+                    static_cast<float>(block.output_start_iz - block.datum_iz);
+                wavefield[model.index(target_x, target_z)] =
+                    (1.0f - weight) * wavefield[model.index(target_x, target_z)] +
+                    weight * propagated;
+            } else {
+                wavefield[model.index(target_x, target_z)] = propagated;
+            }
+        }
+    }
+    return metric;
+}
+
+std::vector<ComplexF> initialize_local_primary_field(
+    const FmmModel& model,
+    const RecursiveBlock& first,
+    const std::vector<float>& traveltime,
+    int source_x,
+    int source_z,
+    float frequency)
+{
+    std::vector<ComplexF> wavefield(
+        static_cast<std::size_t>(model.nx) * model.nz,
+        ComplexF(0.0f, 0.0f));
+    const float omega = 2.0f * static_cast<float>(kPi) * frequency;
+    const float minimum_time = 0.10f * std::min(model.dx, model.dz) /
+        model.velocity[model.index(source_x, source_z)];
+    for (int iz = first.output_start_iz; iz <= first.output_end_iz; ++iz) {
+        for (int ix = 0; ix < model.nx; ++ix) {
+            const float argument = omega * std::max(
+                traveltime[model.index(ix, iz)], minimum_time);
+            const double j0 = std::cyl_bessel_j(0.0, argument);
+            const double y0 = std::cyl_neumann(0.0, argument);
+            const ComplexF outgoing(
+                static_cast<float>(-0.25 * y0),
+                static_cast<float>(0.25 * j0));
+            // bf1d propagates exp(-i*omega*tau); store that convention during
+            // recursion and conjugate once before the Helmholtz solve.
+            wavefield[model.index(ix, iz)] = std::conj(outgoing);
+        }
+    }
+    return wavefield;
+}
+
+RecursiveResult build_recursive_initial(const FmmModel& model,
+                                        int source_x,
+                                        int source_z,
+                                        float frequency,
+                                        const RecursiveSettings& settings)
+{
+    const auto total_started = Clock::now();
+    RecursiveResult result;
+    const std::vector<RecursiveBlock> blocks = make_four_blocks(
+        model, source_z, settings.overlap_rows);
+    std::cout << "\nFour-block recursive layout:\n";
+    for (const RecursiveBlock& block : blocks) {
+        std::cout << "  block " << block.id + 1
+                  << ": output=" << block.output_start_iz
+                  << ".." << block.output_end_iz
+                  << ", datum=" << block.datum_iz << '\n';
+    }
+
+    auto started = Clock::now();
+    const std::vector<float> primary = solve_repository_fmm(
+        model, source_x, source_z);
+    result.primary_fmm_seconds = elapsed_seconds(started);
+    result.primary_traveltime = fmm_to_matlab_order(model, primary);
+    result.one_way_field = initialize_local_primary_field(
+        model, blocks.front(), primary, source_x, source_z, frequency);
+    result.block_snapshots.push_back(result.one_way_field);
+
+    BlockMetric first_metric;
+    first_metric.block = blocks.front();
+    first_metric.fmm_sources = 1;
+    first_metric.fmm_seconds = result.primary_fmm_seconds;
+    const auto primary_range = std::minmax_element(primary.begin(), primary.end());
+    first_metric.minimum_traveltime = *primary_range.first;
+    first_metric.maximum_traveltime = *primary_range.second;
+    result.block_metrics.push_back(first_metric);
+
+    for (std::size_t index = 1; index < blocks.size(); ++index) {
+        const RecursiveBlock& block = blocks[index];
+        std::cout << "\nBlock " << block.id + 1
+                  << ": true eFMM table at datum z=" << block.datum_iz << '\n';
+        TravelTable table = build_true_fmm_table(
+            model, block, settings.threads);
+        std::cout << "  table="
+                  << table.values.size() * sizeof(float) / 1.0e6
+                  << " MB, FMM=" << table.seconds << " s, tau=["
+                  << table.minimum << ',' << table.maximum << "] s\n";
+        BlockMetric metric = propagate_block_with_butterfly(
+            model, block, settings, table, frequency, result.one_way_field);
+        std::cout << "  bf1d build=" << metric.butterfly_build_seconds
+                  << " s, apply=" << metric.butterfly_apply_seconds
+                  << " s, direct-check error=" << std::scientific
+                  << metric.direct_relative_error
+                  << ", overlap mismatch=" << metric.overlap_mismatch_before
+                  << " -> " << metric.overlap_mismatch_after
+                  << std::fixed << '\n';
+        if (settings.save_fmm_samples &&
+            !table.middle_source_full_field.empty()) {
+            result.datum_middle_source_traveltimes.push_back(
+                fmm_to_matlab_order(model, table.middle_source_full_field));
+        }
+        result.block_metrics.push_back(metric);
+        result.block_snapshots.push_back(result.one_way_field);
+    }
+    result.total_seconds = elapsed_seconds(total_started);
+    return result;
+}
+
+Vector one_way_to_helmholtz(const FmmModel& fmm_model,
+                            const Model& model,
+                            const Parameters& p,
+                            const std::vector<ComplexF>& one_way)
+{
+    Vector output(model.nx * model.nz);
+    for (int ix = 0; ix < model.nx; ++ix) {
+        for (int iz = 0; iz < model.nz; ++iz) {
+            output[model.index(iz, ix)] = static_cast<Complex>(
+                std::conj(one_way[fmm_model.index(ix, iz)]));
+        }
+    }
+    if (p.use_pml_taper && p.nabs > 0) {
+        const int effective = std::min({p.nabs, model.nx, model.nz});
+        for (int ii = 0; ii < effective; ++ii) {
+            const double sine = std::sin(
+                0.5 * kPi * static_cast<double>(ii + 1) /
+                static_cast<double>(p.nabs + 1));
+            const double factor = sine * sine;
+            for (int ix = 0; ix < model.nx; ++ix) {
+                output[model.index(ii, ix)] *= factor;
+                output[model.index(model.nz - ii - 1, ix)] *= factor;
+            }
+            for (int iz = 0; iz < model.nz; ++iz) {
+                output[model.index(iz, ii)] *= factor;
+                output[model.index(iz, model.nx - ii - 1)] *= factor;
+            }
+        }
+    }
+    return output;
+}
+
+Vector load_split_float_reference(const std::string& real_file,
+                                  const std::string& imag_file,
+                                  int count)
+{
+    const auto read_component = [count](const std::string& filename) {
+        std::ifstream stream(filename, std::ios::binary);
+        if (!stream) throw std::runtime_error("cannot open reference: " + filename);
+        std::vector<float> values(static_cast<std::size_t>(count));
+        stream.read(reinterpret_cast<char*>(values.data()),
+                    static_cast<std::streamsize>(values.size() * sizeof(float)));
+        if (stream.gcount() != static_cast<std::streamsize>(
+                values.size() * sizeof(float))) {
+            throw std::runtime_error("split reference has the wrong size: " + filename);
+        }
+        char extra = 0;
+        if (stream.read(&extra, 1)) {
+            throw std::runtime_error("split reference has extra samples: " + filename);
+        }
+        return values;
+    };
+    const std::vector<float> real = read_component(real_file);
+    const std::vector<float> imag = read_component(imag_file);
+    Vector output(count);
+    for (int index = 0; index < count; ++index) {
+        output[index] = Complex(real[static_cast<std::size_t>(index)],
+                                imag[static_cast<std::size_t>(index)]);
+    }
+    return output;
+}
+
+void write_block_metrics(const fs::path& filename,
+                         const std::vector<BlockMetric>& metrics)
+{
+    std::ofstream stream(filename);
+    stream << std::setprecision(17)
+           << "block,output_start_iz,output_end_iz,datum_iz,fmm_sources,"
+              "table_megabytes,fmm_seconds,butterfly_build_seconds,"
+              "butterfly_apply_seconds,direct_check_seconds,"
+              "direct_relative_error,overlap_scale_real,overlap_scale_imag,"
+              "overlap_mismatch_before,overlap_mismatch_after,min_tau,max_tau\n";
+    for (const BlockMetric& metric : metrics) {
+        stream << metric.block.id + 1 << ','
+               << metric.block.output_start_iz << ','
+               << metric.block.output_end_iz << ','
+               << metric.block.datum_iz << ','
+               << metric.fmm_sources << ','
+               << metric.table_megabytes << ','
+               << metric.fmm_seconds << ','
+               << metric.butterfly_build_seconds << ','
+               << metric.butterfly_apply_seconds << ','
+               << metric.direct_check_seconds << ','
+               << metric.direct_relative_error << ','
+               << metric.overlap_scale.real() << ','
+               << metric.overlap_scale.imag() << ','
+               << metric.overlap_mismatch_before << ','
+               << metric.overlap_mismatch_after << ','
+               << metric.minimum_traveltime << ','
+               << metric.maximum_traveltime << '\n';
+    }
+}
+
+void write_recursive_hybrid_csv(const fs::path& filename,
+                                const std::vector<StateMetric>& metrics)
+{
+    std::ofstream stream(filename);
+    stream << std::setprecision(17)
+           << "outer,fine_gmres_steps,hybrid_residual,hybrid_true_residual,"
+              "hybrid_error,alpha_real,alpha_imag,abs_alpha,"
+              "phase_coarse_norm_ref,gmres_correction_norm_ref,"
+              "hybrid_cumulative_time\n";
+    for (const StateMetric& metric : metrics) {
+        stream << metric.outer << ',' << metric.fine_steps << ','
+               << metric.relative_residual << ','
+               << metric.true_relative_residual << ','
+               << metric.relative_error << ',' << metric.alpha.real() << ','
+               << metric.alpha.imag() << ',' << std::abs(metric.alpha) << ','
+               << metric.coarse_correction_norm_over_reference << ','
+               << metric.gmres_correction_norm_over_reference << ','
+               << metric.elapsed << '\n';
+    }
+}
+
+void write_recursive_restart_csv(const fs::path& filename,
+                                 const RestartedResult& zero,
+                                 const RestartedResult& kirchhoff)
+{
+    std::ofstream stream(filename);
+    stream << std::setprecision(17)
+           << "method,inner_iteration,relative_residual\n";
+    for (std::size_t i = 0; i < zero.history_steps.size(); ++i) {
+        stream << "zero_start," << zero.history_steps[i] << ','
+               << zero.history_residuals[i] << '\n';
+    }
+    for (std::size_t i = 0; i < kirchhoff.history_steps.size(); ++i) {
+        stream << "recursive_kirchhoff_start,"
+               << kirchhoff.history_steps[i] << ','
+               << kirchhoff.history_residuals[i] << '\n';
+    }
+}
+
+std::string json_number(double value)
+{
+    if (!std::isfinite(value)) return "null";
+    std::ostringstream stream;
+    stream << std::setprecision(17) << value;
+    return stream.str();
+}
+
+void write_recursive_metadata(
+    const fs::path& filename,
+    const Model& model,
+    const Parameters& p,
+    const RecursiveSettings& settings,
+    const RecursiveResult& recursive,
+    Complex scale,
+    double unscaled_residual,
+    double initial_residual,
+    double initial_error,
+    double reference_residual,
+    const HybridResult& hybrid,
+    const RestartedResult& zero,
+    const RestartedResult& kirchhoff,
+    double coarse_seconds)
+{
+    std::ofstream stream(filename);
+    stream << std::setprecision(17)
+           << "{\n"
+           << "  \"method\": \"four_block_true_efmm_bf1d_simplified_kirchhoff_global_gmres\",\n"
+           << "  \"nx\": " << model.nx << ",\n"
+           << "  \"nz\": " << model.nz << ",\n"
+           << "  \"dx\": " << p.dx << ",\n"
+           << "  \"dz\": " << p.dz << ",\n"
+           << "  \"frequency\": " << p.frequency << ",\n"
+           << "  \"source_x_matlab\": " << model.source_x + 1 << ",\n"
+           << "  \"source_z_matlab\": " << model.source_z + 1 << ",\n"
+           << "  \"block_count\": " << settings.block_count << ",\n"
+           << "  \"overlap_rows\": " << settings.overlap_rows << ",\n"
+           << "  \"fmm_backend\": \"SERECKIRCH efmm_solver\",\n"
+           << "  \"butterfly_backend\": \"bf1d_strict_segmented_phase_amp\",\n"
+           << "  \"kirchhoff_form\": \"simplified one-way value-only integral\",\n"
+           << "  \"overlap_stitch\": \"complex least-squares fit plus linear cross-fade\",\n"
+           << "  \"bf_p\": " << settings.bf_p << ",\n"
+           << "  \"bf_leaf\": " << settings.bf_leaf << ",\n"
+           << "  \"bf_phase_tol\": " << settings.bf_phase_tol << ",\n"
+           << "  \"recursive_seconds\": " << recursive.total_seconds << ",\n"
+           << "  \"primary_fmm_seconds\": " << recursive.primary_fmm_seconds << ",\n"
+           << "  \"initial_scale_real\": " << scale.real() << ",\n"
+           << "  \"initial_scale_imag\": " << scale.imag() << ",\n"
+           << "  \"unscaled_initial_residual\": "
+           << json_number(unscaled_residual) << ",\n"
+           << "  \"scaled_initial_residual\": "
+           << json_number(initial_residual) << ",\n"
+           << "  \"scaled_initial_error\": "
+           << json_number(initial_error) << ",\n"
+           << "  \"reference_residual\": "
+           << json_number(reference_residual) << ",\n"
+           << "  \"coarse_setup_seconds\": " << coarse_seconds << ",\n"
+           << "  \"hybrid_outer_iterations\": "
+           << hybrid.metrics.back().outer << ",\n"
+           << "  \"hybrid_fine_gmres_steps\": "
+           << hybrid.metrics.back().fine_steps << ",\n"
+           << "  \"hybrid_final_residual\": "
+           << hybrid.metrics.back().relative_residual << ",\n"
+           << "  \"hybrid_final_error\": "
+           << json_number(hybrid.metrics.back().relative_error) << ",\n"
+           << "  \"zero_gmres_iterations\": " << zero.inner_iterations << ",\n"
+           << "  \"zero_gmres_final_residual\": "
+           << zero.relative_residual << ",\n"
+           << "  \"zero_gmres_final_error\": "
+           << json_number(zero.relative_error) << ",\n"
+           << "  \"kirchhoff_gmres_iterations\": "
+           << kirchhoff.inner_iterations << ",\n"
+           << "  \"kirchhoff_gmres_final_residual\": "
+           << kirchhoff.relative_residual << ",\n"
+           << "  \"kirchhoff_gmres_final_error\": "
+           << json_number(kirchhoff.relative_error) << "\n"
+           << "}\n";
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    try {
+        const Arguments arguments(argc, argv);
+        if (arguments.help()) {
+            print_recursive_help();
+            return 0;
+        }
+        Parameters p = parse_parameters(arguments);
+        const RecursiveSettings settings = parse_recursive_settings(arguments);
+#ifdef _OPENMP
+        omp_set_dynamic(0);
+        omp_set_max_active_levels(1);
+        if (settings.threads > 0) omp_set_num_threads(settings.threads);
+#endif
+        const fs::path output = fs::absolute(p.output_dir);
+        const fs::path fields = output / "fields";
+        fs::create_directories(fields);
+
+        std::cout << "Recursive true-FMM/bf1d Kirchhoff initial field + global GMRES\n"
+                  << "  model=" << p.model_file << "\n"
+                  << "  requested frequency=" << p.frequency << " Hz\n";
+        const Model model = read_model(p);
+        const int n = model.nx * model.nz;
+        const FmmModel fmm_model = make_fmm_model(model, p);
+        write_float_field(fields / "velocity_m_per_s.f32", model.velocity);
+
+        auto started = Clock::now();
+        HelmholtzSystem system = build_helmholtz(model, p);
+        const double matrix_seconds = elapsed_seconds(started);
+        const double rhs_norm = system.rhs.norm();
+        std::cout << "Helmholtz: N=" << n
+                  << ", nnz=" << system.matrix.nonZeros()
+                  << ", build=" << matrix_seconds << " s\n";
+
+        Vector reference;
+        const Vector* reference_pointer = nullptr;
+        if (!settings.reference_real.empty()) {
+            reference = load_split_float_reference(
+                settings.reference_real, settings.reference_imag, n);
+            reference_pointer = &reference;
+            std::cout << "Loaded split float32 Helmholtz reference.\n";
+        } else if (p.reference_mode == "read") {
+            reference = load_reference(p.reference_file, n);
+            reference_pointer = &reference;
+        } else if (p.reference_mode == "direct") {
+            std::cout << "Computing sparse-direct reference...\n";
+            reference = direct_reference(system.matrix, system.rhs);
+            reference_pointer = &reference;
+        }
+        double reference_residual = std::numeric_limits<double>::quiet_NaN();
+        if (reference_pointer) {
+            reference_residual =
+                (system.rhs - system.matrix * reference).norm() / rhs_norm;
+            write_real_imag_field(fields / "reference", reference);
+            std::cout << "Reference relative residual=" << std::scientific
+                      << reference_residual << std::fixed << '\n';
+        }
+
+        RecursiveResult recursive = build_recursive_initial(
+            fmm_model, model.source_x, model.source_z,
+            static_cast<float>(p.frequency), settings);
+        write_float_field(
+            fields / "fmm_primary_traveltime_s.f32",
+            recursive.primary_traveltime);
+        for (std::size_t index = 0;
+             index < recursive.datum_middle_source_traveltimes.size(); ++index) {
+            write_float_field(
+                fields / ("fmm_block_" + three_digits(
+                    static_cast<int>(index + 2)) +
+                    "_middle_datum_source_traveltime_s.f32"),
+                recursive.datum_middle_source_traveltimes[index]);
+        }
+
+        Vector unscaled = one_way_to_helmholtz(
+            fmm_model, model, p, recursive.one_way_field);
+        const double unscaled_residual =
+            (system.rhs - system.matrix * unscaled).norm() / rhs_norm;
+        const Vector action = system.matrix * unscaled;
+        const Complex denominator = action.dot(action);
+        Complex scale(1.0, 0.0);
+        if (std::abs(denominator) > std::numeric_limits<double>::epsilon()) {
+            scale = action.dot(system.rhs) / denominator;
+        }
+        const Vector initial = scale * unscaled;
+        const double initial_residual =
+            (system.rhs - system.matrix * initial).norm() / rhs_norm;
+        const double initial_error = relative_error(initial, reference_pointer);
+        write_real_imag_field(fields / "kirchhoff_initial_unscaled", unscaled);
+        write_real_imag_field(fields / "kirchhoff_initial", initial);
+        for (std::size_t index = 0;
+             index < recursive.block_snapshots.size(); ++index) {
+            Vector snapshot = one_way_to_helmholtz(
+                fmm_model, model, p, recursive.block_snapshots[index]);
+            snapshot *= scale;
+            write_real_imag_field(
+                fields / ("kirchhoff_block_" + three_digits(
+                    static_cast<int>(index + 1))), snapshot);
+        }
+        std::cout << "Recursive Kirchhoff initial: raw residual="
+                  << std::scientific << unscaled_residual
+                  << ", scaled residual=" << initial_residual
+                  << ", error=" << initial_error
+                  << ", scale=" << scale << std::fixed << '\n';
+
+        std::cout << "Building primary-eFMM phase coarse space q="
+                  << p.q_coarse << "...\n";
+        CoarseSpace coarse = build_phase_coarse_space(
+            system.matrix, model, p, recursive.primary_traveltime);
+        HybridResult hybrid = run_hybrid(
+            system.matrix, system.rhs, initial, coarse,
+            reference_pointer, p, fields);
+        write_real_imag_field(fields / "hybrid_final", hybrid.final);
+
+        std::vector<int> matched_steps;
+        for (const StateMetric& metric : hybrid.metrics) {
+            matched_steps.push_back(metric.fine_steps);
+        }
+        const SnapshotResult zero_matched = continuous_gmres_selected(
+            system.matrix, system.rhs, Vector::Zero(n), matched_steps,
+            reference_pointer, fields, "zero", p.save_frame_fields);
+
+        const RestartedResult zero_target = restarted_gmres_to_target(
+            system.matrix, system.rhs, Vector::Zero(n), p.zero_restart,
+            p.target_relres, p.zero_max_cycles, reference_pointer,
+            "zero-start GMRES");
+        const RestartedResult kirchhoff_target = restarted_gmres_to_target(
+            system.matrix, system.rhs, initial, p.zero_restart,
+            p.target_relres, p.zero_max_cycles, reference_pointer,
+            "recursive-Kirchhoff-start GMRES");
+        write_real_imag_field(
+            fields / "zero_restarted_target", zero_target.final);
+        write_real_imag_field(
+            fields / "kirchhoff_restarted_target", kirchhoff_target.final);
+
+        write_block_metrics(output / "recursive_block_metrics.csv",
+                            recursive.block_metrics);
+        write_recursive_hybrid_csv(output / "hybrid_outer_metrics.csv",
+                                   hybrid.metrics);
+        write_matched_csv(output / "matched_step_comparison.csv",
+                          hybrid.metrics, zero_matched);
+        write_recursive_restart_csv(
+            output / "restarted_gmres_histories.csv",
+            zero_target, kirchhoff_target);
+        write_recursive_metadata(
+            output / "metadata.json", model, p, settings, recursive, scale,
+            unscaled_residual, initial_residual, initial_error,
+            reference_residual, hybrid, zero_target, kirchhoff_target,
+            coarse.setup_seconds);
+
+        std::ofstream log(output / "results.txt");
+        log << std::setprecision(12) << std::scientific
+            << "recursive_kirchhoff_initial_residual " << initial_residual << '\n'
+            << "recursive_kirchhoff_initial_error " << initial_error << '\n'
+            << "hybrid_final_residual "
+            << hybrid.metrics.back().relative_residual << '\n'
+            << "hybrid_final_error "
+            << hybrid.metrics.back().relative_error << '\n'
+            << "zero_target_steps " << zero_target.inner_iterations << '\n'
+            << "kirchhoff_target_steps "
+            << kirchhoff_target.inner_iterations << '\n';
+
+        std::cout << "\n================ RECURSIVE KIRCHHOFF SUMMARY ================\n"
+                  << "FMM backend: SERECKIRCH efmm_solver\n"
+                  << "Butterfly backend: bf1d_strict_segmented_phase_amp\n"
+                  << "Blocks/overlap: 4/" << settings.overlap_rows << " rows\n"
+                  << "Initial residual/error: " << std::scientific
+                  << initial_residual << '/' << initial_error << '\n'
+                  << "Hybrid final residual/error: "
+                  << hybrid.metrics.back().relative_residual << '/'
+                  << hybrid.metrics.back().relative_error << '\n'
+                  << "Zero/Kirchhoff restarted steps: "
+                  << zero_target.inner_iterations << '/'
+                  << kirchhoff_target.inner_iterations << '\n'
+                  << "Outputs: " << output << '\n'
+                  << "==============================================================\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "ERROR: " << error.what() << '\n';
+        return 1;
+    }
+}
