@@ -48,6 +48,8 @@ option(enable_doc       "Add target 'doc' to build Doxygen documentation" OFF)
 option(enable_examples  "Build examples" ON)
 option(enable_fortran   "Build Fortran interface" ${enable_fortran_xSDK})
 option(enable_tests     "Build tests" ON)
+option(SUPERLU_ENABLE_INSTALL
+       "Generate SuperLU install and package-export rules" ON)
 
 include(CTest)
 include(GNUInstallDirs)

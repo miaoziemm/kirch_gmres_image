@@ -114,8 +114,8 @@ endif()
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(KirchDependencies)
 include(KirchCompilerOptions)
+include(KirchDependencies)
 include(KirchEigen)
 
 include(KirchSuperLU)

@@ -1,4 +1,4 @@
-in="v_mar_298_1024_km_new_sm.bin"
+in="model/v_mar_298_1024_km_new.bin"
 esize=4 
 data_format="native_float"
 n1=298

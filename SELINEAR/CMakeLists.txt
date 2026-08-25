@@ -1,4 +1,5 @@
 set(SELINEAR_HEADERS
+    include/global_preconditioned_gmres.hpp
     include/se_eigen.hpp
     include/se_eigen_solver.hpp
     include/se_eigen_solver_impl.hpp

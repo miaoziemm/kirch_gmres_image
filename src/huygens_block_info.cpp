@@ -1,4 +1,4 @@
-#include "huygens_cli.hpp"
+#include <SERECKIRCH/include/huygens_cli.hpp>
 #include "program_help.hpp"
 
 #include <SERECKIRCH/include/huygens_sweep.hpp>

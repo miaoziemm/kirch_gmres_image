@@ -251,6 +251,7 @@ set_target_properties(superlu PROPERTIES
 # Define GNU standard installation directories
 include(GNUInstallDirs)
 
+if(SUPERLU_ENABLE_INSTALL)
 install(TARGETS superlu
   EXPORT superluTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -294,3 +295,4 @@ export(EXPORT superluTargets
   )
 
 export(PACKAGE superlu)
+endif()

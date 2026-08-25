@@ -5,6 +5,9 @@ set(RECKIRCH_HEADERS
     include/se_butterfly.hpp
     include/decart.h
     include/efmm.h
+    include/frequency_kirchhoff_imaging_common.hpp
+    include/global_bf_imaging_workflow.hpp
+    include/huygens_cli.hpp
     include/huygens_sweep.hpp
     include/eikods.h
     include/kirdat.h
@@ -97,7 +100,8 @@ if(KIRCH_FFTW_PROVIDER STREQUAL "BUNDLED")
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/fftw/api>)
 endif()
 
-if(KIRCH_ENABLE_BUTTERFLYPACK)
+if(KIRCH_ENABLE_BUTTERFLYPACK AND
+   (TARGET ButterflyPACK::float OR TARGET ButterflyPACK::double))
     target_sources(reckirch PRIVATE src/se_butterfly.cpp)
 endif()
 

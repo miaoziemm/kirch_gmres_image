@@ -1,6 +1,7 @@
 #include <SEBASIC/include/se_basic.h>
 #include <SEFILESYSTEM/include/se_par_sep.h>
 #include "../SEWAVE/sewave2d.h"
+#include "program_help.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +55,8 @@ void check_stability(const sewave::Grid2D& velocity,
 
 int main(int argc, char** argv)
 {
+    if (kirch_help::show_if_requested(argc, argv)) return 0;
+
     se_par_init(argc, argv);
     try {
         if (!se_have_par("velocity")) {

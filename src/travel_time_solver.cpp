@@ -1,4 +1,4 @@
-#include "huygens_cli.hpp"
+#include <SERECKIRCH/include/huygens_cli.hpp>
 #include "program_help.hpp"
 
 #include <SERECKIRCH/include/huygens_sweep.hpp>
@@ -70,6 +70,8 @@ int main(int argc, char** argv)
         const int target_x_stride = huygens_cli::optional_int("target_x_stride", 1);
         const int target_z_stride = huygens_cli::optional_int("target_z_stride", 1);
         const int requested_threads = huygens_cli::optional_int("threads", 0);
+        const int include_propagation_overlap = huygens_cli::optional_int(
+            "include_propagation_overlap", 0);
         const float max_table_mb = huygens_cli::optional_float("max_table_mb", 8192.0f);
 
         if (source_stride < 1 || target_x_stride < 1 || target_z_stride < 1) {
@@ -80,6 +82,11 @@ int main(int argc, char** argv)
         }
         if (requested_threads < 0) {
             throw std::invalid_argument("threads must be non-negative");
+        }
+        if (include_propagation_overlap != 0 &&
+            include_propagation_overlap != 1) {
+            throw std::invalid_argument(
+                "include_propagation_overlap must be 0 or 1");
         }
 
         int available_threads = 1;
@@ -107,14 +114,19 @@ int main(int argc, char** argv)
         const se::huygens::BlockInfo info = se::huygens::read_block_info(block_file);
         se::huygens::validate_block_info(info, &model);
 
+        constexpr std::size_t first_block = 1;
         const int propagation_blocks = static_cast<int>(info.blocks.size()) - 1;
         const int metrics = 4;
         std::vector<float> timing_values(
             static_cast<std::size_t>(metrics) * propagation_blocks, 0.0f);
         double total_fmm_seconds = 0.0;
 
-        for (std::size_t iblock = 1; iblock < info.blocks.size(); ++iblock) {
-            const se::huygens::Block& block = info.blocks[iblock];
+        for (std::size_t iblock = first_block;
+             iblock < info.blocks.size(); ++iblock) {
+            se::huygens::Block block = info.blocks[iblock];
+            if (include_propagation_overlap != 0 && info.overlap_rows > 0) {
+                block.target_start_iz = block.source_iz + 1;
+            }
             const se::huygens::LayerGeometry geometry =
                 se::huygens::make_layer_geometry(
                     model, block, source_stride, target_x_stride, target_z_stride);
@@ -269,7 +281,7 @@ int main(int argc, char** argv)
                 "source_normal_traveltime_derivative",
                 source_stride, target_x_stride, target_z_stride);
 
-            const int column = static_cast<int>(iblock) - 1;
+            const int column = static_cast<int>(iblock - first_block);
             timing_values[static_cast<std::size_t>(column) * metrics + 0] =
                 static_cast<float>(seconds);
             timing_values[static_cast<std::size_t>(column) * metrics + 1] =
