@@ -51,7 +51,12 @@ if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float
     kirch_add_application(frequency_kirchhoff_imaging_bf_gmres
         frequency_kirchhoff_imaging_bf_gmres.cpp
         ${PROJECT_SOURCE_DIR}/SERECKIRCH/src/global_bf_imaging_workflow.cpp)
+    kirch_add_application(f_image_rtm_kirch_multishot
+        f_image_rtm_kirch_multishot.cpp
+        ${PROJECT_SOURCE_DIR}/SERECKIRCH/src/global_bf_imaging_workflow.cpp)
     target_link_libraries(frequency_kirchhoff_imaging_bf_gmres
+        PRIVATE Kirch::reckirch Kirch::eigen Kirch::SuperLU)
+    target_link_libraries(f_image_rtm_kirch_multishot
         PRIVATE Kirch::reckirch Kirch::eigen Kirch::SuperLU)
 
 else()

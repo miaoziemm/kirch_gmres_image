@@ -13,6 +13,8 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <filesystem>
+#include <cstdint>
 #include <memory>
 #include <limits>
 #include <stdexcept>
@@ -568,24 +570,22 @@ void phase_shift_first_block(const se::huygens::Model2D& model,
                              const se::huygens::Block& block,
                              const std::vector<int>& target_iz,
                              float frequency,
-                             const PackedComplex& packed,
-                             std::size_t frequency_local,
+                             double mean_velocity,
+                             const std::vector<fki::Complex>& boundary,
+                             std::size_t frequency_index,
                              std::vector<fki::Complex>& output)
 {
     const int nx = model.nx;
-    const std::size_t packed_offset =
-        2 * frequency_local * static_cast<std::size_t>(nx);
-    if (packed_offset + 2 * static_cast<std::size_t>(nx) > packed.size()) {
+    const std::size_t boundary_offset =
+        frequency_index * static_cast<std::size_t>(nx);
+    if (boundary_offset + static_cast<std::size_t>(nx) > boundary.size()) {
         throw std::out_of_range(
-            "phase-shift frequency exceeds packed boundary state");
+            "phase-shift frequency exceeds boundary state");
     }
-    std::vector<fki::Complex> spectrum(static_cast<std::size_t>(nx));
-    for (int ix = 0; ix < nx; ++ix) {
-        const std::size_t offset =
-            packed_offset + 2 * static_cast<std::size_t>(ix);
-        spectrum[static_cast<std::size_t>(ix)] = fki::Complex(
-            packed[offset], packed[offset + 1]);
-    }
+    std::vector<fki::Complex> spectrum(
+        boundary.begin() + static_cast<std::ptrdiff_t>(boundary_offset),
+        boundary.begin() + static_cast<std::ptrdiff_t>(
+            boundary_offset + static_cast<std::size_t>(nx)));
     fftwf_plan forward = fftwf_plan_dft_1d(
         nx, reinterpret_cast<fftwf_complex*>(spectrum.data()),
         reinterpret_cast<fftwf_complex*>(spectrum.data()), FFTW_FORWARD, FFTW_ESTIMATE);
@@ -593,17 +593,8 @@ void phase_shift_first_block(const se::huygens::Model2D& model,
     fftwf_execute(forward);
     fftwf_destroy_plan(forward);
 
-    double velocity_sum = 0.0;
-    std::size_t velocity_count = 0;
-    for (const int iz : target_iz) {
-        for (int ix = 0; ix < nx; ++ix) {
-            velocity_sum += model.velocity[model.index(ix, iz)];
-            ++velocity_count;
-        }
-    }
-    const double v0 = velocity_sum / std::max<std::size_t>(velocity_count, 1);
     const double omega = 2.0 * 3.14159265358979323846 * frequency;
-    const double k0 = omega / v0;
+    const double k0 = omega / mean_velocity;
     output.resize(static_cast<std::size_t>(target_iz.size()) * nx);
     std::vector<fki::Complex> line(static_cast<std::size_t>(nx));
     // FFTW plans describe the transform layout, not the values.  Reuse one
@@ -728,61 +719,158 @@ gpg::Vector build_global_source_aexp(
     return field;
 }
 
-std::size_t global_receiver_index(
-    std::size_t shot, std::size_t frequency, std::size_t grid,
-    std::size_t frequency_count, std::size_t grid_size)
-{
-    return (shot * frequency_count + frequency) * grid_size + grid;
-}
-
-void accumulate_global_receiver_block(
-    const se::huygens::Model2D& model,
-    const std::vector<int>& target_depths,
-    const std::vector<fki::Complex>& receiver,
-    const std::vector<float>& depth_weights,
-    std::size_t shot, std::size_t frequency,
-    std::size_t frequency_count,
-    std::vector<fki::Complex>& global_receiver)
-{
-    if (receiver.size() !=
-            target_depths.size() * static_cast<std::size_t>(model.nx) ||
-        depth_weights.size() != target_depths.size()) {
-        throw std::invalid_argument(
-            "global receiver block size is inconsistent");
+class ReceiverBlockStore {
+public:
+    ReceiverBlockStore(std::filesystem::path directory, std::string mode,
+                       double estimated_megabytes, double memory_limit_megabytes,
+                       std::size_t shots, std::size_t frequencies,
+                       const se::huygens::Model2D& model)
+        : directory_(std::move(directory)), shots_(shots), frequencies_(frequencies),
+          nx_(model.nx), grid_size_(static_cast<std::size_t>(model.nx) * model.nz)
+    {
+        if (mode != "auto" && mode != "memory" && mode != "disk")
+            throw std::invalid_argument("receiver_store must be auto, memory, or disk");
+        memory_backed_ = mode == "memory" ||
+            (mode == "auto" && estimated_megabytes <= memory_limit_megabytes);
+        if (mode == "memory" && estimated_megabytes > memory_limit_megabytes)
+            throw std::runtime_error("receiver_store=memory requires " +
+                std::to_string(estimated_megabytes) +
+                " MiB, exceeding global_storage_max_mb=" +
+                std::to_string(memory_limit_megabytes));
+        if (!memory_backed_) std::filesystem::create_directories(directory_);
     }
-    const std::size_t grid_size =
-        static_cast<std::size_t>(model.nx) * model.nz;
-    for (std::size_t iz_local = 0;
-         iz_local < target_depths.size(); ++iz_local) {
-        const int iz = target_depths[iz_local];
-        const float weight = depth_weights[iz_local];
-        for (int ix = 0; ix < model.nx; ++ix) {
-            const std::size_t local =
-                iz_local * static_cast<std::size_t>(model.nx) + ix;
-            const std::size_t grid = model.index(ix, iz);
-            global_receiver[global_receiver_index(
-                shot, frequency, grid, frequency_count, grid_size)] +=
-                weight * receiver[local];
+
+    ~ReceiverBlockStore()
+    {
+        std::error_code error;
+        if (!memory_backed_) {
+            for (auto& block : blocks_) {
+                block.stream.close();
+                std::filesystem::remove(block.path, error);
+                error.clear();
+            }
+            // Remove the configured directory only when it is empty; never delete
+            // unrelated user files if a shared scratch parent was supplied.
+            std::filesystem::remove(directory_, error);
         }
     }
-}
 
-gpg::Vector load_global_receiver(
-    const std::vector<fki::Complex>& storage,
-    std::size_t shot, std::size_t frequency,
-    std::size_t frequency_count, std::size_t grid_size)
-{
-    gpg::Vector output(static_cast<Eigen::Index>(grid_size));
-    const std::size_t offset = global_receiver_index(
-        shot, frequency, 0, frequency_count, grid_size);
-    for (std::size_t i = 0; i < grid_size; ++i) {
-        const fki::Complex value = storage[offset + i];
-        output[static_cast<Eigen::Index>(i)] = gpg::Complex(
-            static_cast<double>(value.real()),
-            static_cast<double>(value.imag()));
+    void begin_block(const std::vector<int>& depths,
+                     const std::vector<float>& weights)
+    {
+        if (depths.size() != weights.size())
+            throw std::invalid_argument("receiver-store depth/weight size mismatch");
+        Block block;
+        block.depths = depths;
+        block.weights = weights;
+        block.values_per_record = depths.size() * static_cast<std::size_t>(nx_);
+        if (memory_backed_) {
+            block.memory.assign(shots_ * frequencies_ * block.values_per_record,
+                                fki::Complex(0.0f, 0.0f));
+        } else {
+            block.path = directory_ / ("receiver_block_" +
+                std::to_string(blocks_.size()) + ".bin");
+            block.stream.open(block.path, std::ios::binary | std::ios::in |
+                                          std::ios::out | std::ios::trunc);
+            if (!block.stream)
+                throw std::runtime_error("cannot create receiver scratch file: " + block.path.string());
+        }
+        blocks_.push_back(std::move(block));
     }
-    return output;
-}
+
+    void write(std::size_t shot, std::size_t frequency,
+               const std::vector<fki::Complex>& field)
+    {
+        Block& block = blocks_.back();
+        if (field.size() != block.values_per_record)
+            throw std::invalid_argument("receiver-store field size mismatch");
+        const std::uint64_t record = frequency * shots_ + shot;
+        const std::uint64_t value_offset = record * block.values_per_record;
+        if (memory_backed_) {
+            std::copy(field.begin(), field.end(), block.memory.begin() +
+                      static_cast<std::ptrdiff_t>(value_offset));
+        } else {
+            const std::uint64_t byte_offset = value_offset * sizeof(fki::Complex);
+            block.stream.clear();
+            block.stream.seekp(static_cast<std::streamoff>(byte_offset));
+            block.stream.write(reinterpret_cast<const char*>(field.data()),
+                               static_cast<std::streamsize>(field.size() * sizeof(fki::Complex)));
+            if (!block.stream) throw std::runtime_error("receiver scratch write failed");
+            bytes_written_ += field.size() * sizeof(fki::Complex);
+        }
+    }
+
+    void finalize_writes()
+    {
+        if (writes_finalized_) return;
+        if (!memory_backed_) {
+            for (Block& block : blocks_) {
+                block.stream.flush();
+                if (!block.stream)
+                    throw std::runtime_error("receiver scratch flush failed");
+            }
+        }
+        writes_finalized_ = true;
+    }
+
+    gpg::Vector load(std::size_t shot, std::size_t frequency,
+                     const se::huygens::Model2D& model)
+    {
+        if (!writes_finalized_)
+            throw std::logic_error("receiver store must be finalized before reading");
+        gpg::Vector output = gpg::Vector::Zero(static_cast<Eigen::Index>(grid_size_));
+        for (Block& block : blocks_) {
+            read_buffer_.resize(block.values_per_record);
+            const std::uint64_t record = frequency * shots_ + shot;
+            const std::uint64_t value_offset = record * block.values_per_record;
+            if (memory_backed_) {
+                std::copy_n(block.memory.begin() + static_cast<std::ptrdiff_t>(value_offset),
+                            block.values_per_record, read_buffer_.begin());
+            } else {
+                const std::uint64_t byte_offset = value_offset * sizeof(fki::Complex);
+                block.stream.clear();
+                block.stream.seekg(static_cast<std::streamoff>(byte_offset));
+                block.stream.read(reinterpret_cast<char*>(read_buffer_.data()),
+                                  static_cast<std::streamsize>(read_buffer_.size() * sizeof(fki::Complex)));
+                if (!block.stream) throw std::runtime_error("receiver scratch read failed");
+                bytes_read_ += read_buffer_.size() * sizeof(fki::Complex);
+            }
+            for (std::size_t ld = 0; ld < block.depths.size(); ++ld) {
+                const int iz = block.depths[ld];
+                const double weight = block.weights[ld];
+                for (int ix = 0; ix < nx_; ++ix) {
+                    const fki::Complex value = read_buffer_[ld * static_cast<std::size_t>(nx_) + ix];
+                    output[static_cast<Eigen::Index>(model.index(ix, iz))] +=
+                        weight * gpg::Complex(value.real(), value.imag());
+                }
+            }
+        }
+        return output;
+    }
+
+    double written_megabytes() const { return bytes_written_ / 1048576.0; }
+    double read_megabytes() const { return bytes_read_ / 1048576.0; }
+    bool memory_backed() const { return memory_backed_; }
+
+private:
+    struct Block {
+        std::vector<int> depths;
+        std::vector<float> weights;
+        std::size_t values_per_record = 0;
+        std::filesystem::path path;
+        std::fstream stream;
+        std::vector<fki::Complex> memory;
+    };
+    std::filesystem::path directory_;
+    std::size_t shots_ = 0, frequencies_ = 0;
+    int nx_ = 0;
+    std::size_t grid_size_ = 0;
+    std::vector<Block> blocks_;
+    bool memory_backed_ = false;
+    bool writes_finalized_ = false;
+    std::vector<fki::Complex> read_buffer_;
+    std::uint64_t bytes_written_ = 0, bytes_read_ = 0;
+};
 
 } // namespace
 
@@ -889,6 +977,14 @@ int with_global_bf_imaging_workflow(
             "global_receiver_mask_rows", 2);
         const float global_storage_max_mb = huygens_cli::optional_float(
             "global_storage_max_mb", 8192.0f);
+        const std::string receiver_store = huygens_cli::optional_string(
+            "receiver_store", "auto");
+        const std::string receiver_store_dir = huygens_cli::optional_string(
+            "receiver_store_dir", ".kirch_receiver_scratch");
+        const std::string per_shot_image_dir = huygens_cli::optional_string(
+            "per_shot_image_dir", "");
+        const float per_shot_image_max_mb = huygens_cli::optional_float(
+            "per_shot_image_max_mb", 4096.0f);
         const float global_source_regularization = huygens_cli::optional_float(
             "global_source_regularization", 0.10f);
 
@@ -1044,6 +1140,24 @@ int with_global_bf_imaging_workflow(
         std::vector<float> image(grid_size, 0.0f);
         std::vector<float> illumination(
             grid_size, 0.0f);
+        const bool write_per_shot_images = !per_shot_image_dir.empty();
+        const double per_shot_required_mb = write_per_shot_images
+            ? 2.0 * states.size() * grid_size * sizeof(float) / 1048576.0 : 0.0;
+        if (per_shot_required_mb > per_shot_image_max_mb) {
+            throw std::runtime_error("per-shot before/after images require " +
+                std::to_string(per_shot_required_mb) +
+                " MiB, exceeding per_shot_image_max_mb=" +
+                std::to_string(per_shot_image_max_mb));
+        }
+        std::vector<std::vector<float>> per_shot_before, per_shot_after;
+        if (write_per_shot_images) {
+            std::filesystem::create_directories(per_shot_image_dir);
+            per_shot_before.assign(states.size(), std::vector<float>(grid_size, 0.0f));
+            per_shot_after.assign(states.size(), std::vector<float>(grid_size, 0.0f));
+            std::cout << "Per-shot images       : " << per_shot_image_dir
+                      << " (before + after correction, " << per_shot_required_mb
+                      << " MiB accumulation buffers)\n";
+        }
 
         // In the global-correction executable the source branch is NOT
         // propagated by Kirchhoff.  Keep the shared ButterflyPACK apply-many
@@ -1054,22 +1168,22 @@ int with_global_bf_imaging_workflow(
                       fki::Complex(0.0f, 0.0f));
         }
 
-        const std::size_t global_receiver_count =
-            states.size() * axis.frequencies.size() * grid_size;
-        const double global_receiver_mb =
-            static_cast<double>(global_receiver_count) *
-            sizeof(fki::Complex) / 1048576.0;
-        if (global_receiver_mb > global_storage_max_mb) {
-            throw std::runtime_error(
-                "global receiver storage requires " +
-                std::to_string(global_receiver_mb) +
-                " MiB, exceeding global_storage_max_mb=" +
-                std::to_string(global_storage_max_mb));
-        }
-        std::vector<fki::Complex> global_receiver_initial(
-            global_receiver_count, fki::Complex(0.0f, 0.0f));
-        std::cout << "Global receiver store : " << global_receiver_mb
-                  << " MiB\n";
+        // Disk tiles retain the true overlap rows for every propagation block.
+        // Include those rows in the auto-backend estimate so memory mode never
+        // exceeds its configured limit merely because blocks overlap.
+        const std::size_t receiver_storage_depths = static_cast<std::size_t>(model.nz) +
+            static_cast<std::size_t>(std::max(info.overlap_rows, 0)) *
+            (info.blocks.empty() ? 0 : info.blocks.size() - 1);
+        const double former_global_receiver_mb =
+            static_cast<double>(states.size()) * axis.frequencies.size() *
+            model.nx * receiver_storage_depths * sizeof(fki::Complex) / 1048576.0;
+        ReceiverBlockStore receiver_store_backend(
+            receiver_store_dir, receiver_store, former_global_receiver_mb,
+            global_storage_max_mb, states.size(), axis.frequencies.size(), model);
+        std::cout << "Receiver storage      : "
+                  << (receiver_store_backend.memory_backed() ? "memory" : "disk-backed block tiles")
+                  << (receiver_store_backend.memory_backed() ? "" : " at " + receiver_store_dir)
+                  << " (estimated full field " << former_global_receiver_mb << " MiB)\n";
 
         const int metrics = 12;
         const int block_count =
@@ -1190,11 +1304,27 @@ int with_global_bf_imaging_workflow(
             const int target_depth_count =
                 static_cast<int>(
                     geometry.target_iz.size());
+            double first_block_mean_velocity = 0.0;
+            if (!uses_butterfly) {
+                std::size_t velocity_count = 0;
+                for (const int iz : geometry.target_iz) {
+                    for (int ix = 0; ix < model.nx; ++ix) {
+                        first_block_mean_velocity +=
+                            model.velocity[model.index(ix, iz)];
+                        ++velocity_count;
+                    }
+                }
+                first_block_mean_velocity /=
+                    std::max<std::size_t>(velocity_count, 1);
+            }
 
             if (geometry.target_iz != block_target_depths[iblock]) {
                 throw std::runtime_error(
                     "precomputed block target depths changed unexpectedly");
             }
+
+            receiver_store_backend.begin_block(
+                geometry.target_iz, image_partition_weights[iblock]);
 
             OverlapCache next_overlap;
             if (seam_enable != 0) {
@@ -1596,39 +1726,23 @@ int with_global_bf_imaging_workflow(
                     std::vector<fki::Complex> source_output(
                         static_cast<std::size_t>(target_depth_count) * model.nx,
                         fki::Complex(0.0f, 0.0f));
-                    std::vector<fki::Complex> receiver_output;
-
+                    // The global workflow never images this local receiver tile
+                    // before overlap alignment: it stores the aligned field and
+                    // performs imaging only after the complete field is assembled.
+                    // Build the propagation buffer directly and avoid a full-tile copy.
+                    std::vector<fki::Complex> receiver_for_propagation;
                     if (!uses_butterfly) {
-                        PackedComplex packed_receiver;
-                        pack_frequency_batch(
-                            states[ishot].receiver_conjugate, ifrequency, 1,
-                            model.nx, packed_receiver);
                         phase_shift_first_block(
-                            model, block, geometry.target_iz,
-                            frequency, packed_receiver, 0, receiver_output);
+                            model, block, geometry.target_iz, frequency,
+                            first_block_mean_velocity,
+                            states[ishot].receiver_conjugate, ifrequency,
+                            receiver_for_propagation);
                     } else {
-                        receiver_output =
+                        receiver_for_propagation =
                             std::move(propagated_depth_major[ishot]);
                     }
-
-                    /*
-                     * Keep two logically different wavefields:
-                     *
-                     *   source_output / receiver_output
-                     *       = raw Kirchhoff/GMRES result used for imaging.
-                     *
-                     *   source_for_propagation / receiver_for_propagation
-                     *       = a copy that may be overlap-aligned/blended and
-                     *         is used only to construct the next block datum.
-                     *
-                     * This avoids applying overlap blending once to the
-                     * wavefield and then a second time through the imaging
-                     * partition-of-unity weights.
-                     */
                     std::vector<fki::Complex> source_for_propagation =
                         source_output;
-                    std::vector<fki::Complex> receiver_for_propagation =
-                        receiver_output;
 
                     if (seam_enable != 0 && iblock > 0 &&
                         !previous_overlap.empty()) {
@@ -1690,12 +1804,8 @@ int with_global_bf_imaging_workflow(
                     // globally corrected.  Use the overlap-consistent
                     // propagation copy and the same partition-of-unity weights
                     // to build one full receiver field per shot/frequency.
-                    accumulate_global_receiver_block(
-                        model, geometry.target_iz,
-                        receiver_for_propagation,
-                        image_partition_weights[iblock],
-                        ishot, ifrequency, axis.frequencies.size(),
-                        global_receiver_initial);
+                    receiver_store_backend.write(
+                        ishot, ifrequency, receiver_for_propagation);
 
                     if (iblock + 1 < info.blocks.size()) {
                         extract_next_boundary_batch(
@@ -1792,6 +1902,7 @@ int with_global_bf_imaging_workflow(
                 << ", rank_max=" << block_max_rank
                 << '\n';
         }
+        receiver_store_backend.finalize_writes();
         };
 
         // ------------------------------------------------------------------
@@ -1865,9 +1976,19 @@ int with_global_bf_imaging_workflow(
                 model, source_traveltimes[ishot], axis.frequencies[ifrequency],
                 source_spectrum[ifrequency], source_ix,
                 global_source_regularization);
-            active_receiver_field = load_global_receiver(
-                global_receiver_initial, ishot, ifrequency,
-                axis.frequencies.size(), grid_size);
+            active_receiver_field = receiver_store_backend.load(
+                ishot, ifrequency, model);
+            if (write_per_shot_images) {
+                const float weight = axis.imaging_weights[ifrequency];
+                for (std::size_t grid = 0; grid < grid_size; ++grid) {
+                    const gpg::Complex us = active_source_field[
+                        static_cast<Eigen::Index>(grid)];
+                    const gpg::Complex ur = active_receiver_field[
+                        static_cast<Eigen::Index>(grid)];
+                    per_shot_before[ishot][grid] +=
+                        weight * static_cast<float>((us * ur).real());
+                }
+            }
             if (active_system) {
                 active_source_field = gpg::embed_physical_field(
                     *active_system, active_source_field);
@@ -1931,8 +2052,11 @@ int with_global_bf_imaging_workflow(
                     static_cast<Eigen::Index>(grid)];
                 const gpg::Complex ur = physical_receiver[
                     static_cast<Eigen::Index>(grid)];
-                image[grid] += weight * static_cast<float>((us * ur).real());
+                const float after_value = weight * static_cast<float>((us * ur).real());
+                image[grid] += after_value;
                 illumination[grid] += weight * static_cast<float>(std::norm(us));
+                if (write_per_shot_images)
+                    per_shot_after[ishot][grid] += after_value;
             }
         };
 
@@ -1978,6 +2102,19 @@ int with_global_bf_imaging_workflow(
 
         fki::finish_image(
             options, model, image, illumination);
+
+        if (write_per_shot_images) {
+            for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
+                const std::string prefix = (std::filesystem::path(per_shot_image_dir) /
+                    ("shot_" + std::to_string(shots[ishot]))).string();
+                se::huygens::write_image_rsf(prefix + "_before_gmres.rsf", model,
+                    per_shot_before[ishot], "per_shot_before_global_gmres");
+                se::huygens::write_image_rsf(prefix + "_after_gmres.rsf", model,
+                    per_shot_after[ishot], "per_shot_after_global_gmres");
+            }
+        }
+        std::cout << "Receiver scratch I/O : wrote " << receiver_store_backend.written_megabytes()
+                  << " MiB, read " << receiver_store_backend.read_megabytes() << " MiB\n";
 
         se::huygens::write_image_rsf(
             options.image,
@@ -2067,7 +2204,13 @@ int with_global_bf_imaging_workflow(
                   total_apply_seconds)},
              {"skipped_receiver_coordinates",
               static_cast<float>(
-                  skipped_receivers)}});
+                  skipped_receivers)},
+             {"global_factor_seconds", static_cast<float>(global_factor_seconds)},
+             {"global_solve_seconds", static_cast<float>(global_solve_seconds)},
+             {"receiver_scratch_written_mb",
+              static_cast<float>(receiver_store_backend.written_megabytes())},
+             {"receiver_scratch_read_mb",
+              static_cast<float>(receiver_store_backend.read_megabytes())}});
 
         std::cout
             << "Rectangular ButterflyPACK + restarted GMRES imaging completed.\n"
