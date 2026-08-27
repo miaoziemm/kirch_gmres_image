@@ -366,20 +366,31 @@ std::shared_ptr<ReusableGeometryState<Real>> acquire_reusable_geometry(
     const Options& options,
     bool* cache_hit)
 {
+    // A single-entry cache cannot reuse trees when a block is split into
+    // several depth chunks: visiting chunk 0..N for every frequency evicts the
+    // preceding chunk before it is needed again.  Keep a small bounded LRU so
+    // the common chunks survive across frequencies without allowing geometry
+    // memory to grow with the number of blocks in a survey.
+    constexpr std::size_t kMaximumCachedGeometries = 16;
     static std::mutex cache_mutex;
-    static std::shared_ptr<ReusableGeometryState<Real>> cache;
+    static std::vector<std::shared_ptr<ReusableGeometryState<Real>>> cache;
 
     std::lock_guard<std::mutex> lock(cache_mutex);
-    if (cache &&
-        cache->matches(rows, columns, row_coordinates,
-                       column_coordinates, options)) {
-        if (cache_hit) *cache_hit = true;
-        return cache;
+    for (auto iterator = cache.begin(); iterator != cache.end(); ++iterator) {
+        if ((*iterator)->matches(rows, columns, row_coordinates,
+                                 column_coordinates, options)) {
+            auto match = *iterator;
+            cache.erase(iterator);
+            cache.push_back(match);
+            if (cache_hit) *cache_hit = true;
+            return match;
+        }
     }
 
     auto replacement = std::make_shared<ReusableGeometryState<Real>>(
         rows, columns, row_coordinates, column_coordinates, options);
-    cache = replacement;
+    if (cache.size() == kMaximumCachedGeometries) cache.erase(cache.begin());
+    cache.push_back(replacement);
     if (cache_hit) *cache_hit = false;
     return replacement;
 }
