@@ -35,6 +35,17 @@ endforeach()
 # The production imaging executable constructs complex-float ButterflyPACK
 # matrices, and therefore must not be offered by configurations which disable
 # that backend.
+if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float)
+    # This target intentionally uses the reference restarted-GMRES algorithm,
+    # which only requires Eigen and does not use the production SuperLU path.
+    kirch_add_application(f_image_rtm_kirch f_image_rtm_kirch.cpp)
+    target_link_libraries(f_image_rtm_kirch
+        PRIVATE Kirch::reckirch Kirch::selinear Kirch::eigen)
+else()
+    message(STATUS
+        "Skipping f_image_rtm_kirch: ButterflyPACK float is unavailable")
+endif()
+
 if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float
    AND TARGET Kirch::SuperLU)
     kirch_add_application(frequency_kirchhoff_imaging_bf_gmres
@@ -42,6 +53,7 @@ if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float
         ${PROJECT_SOURCE_DIR}/SERECKIRCH/src/global_bf_imaging_workflow.cpp)
     target_link_libraries(frequency_kirchhoff_imaging_bf_gmres
         PRIVATE Kirch::reckirch Kirch::eigen Kirch::SuperLU)
+
 else()
     message(STATUS
         "Skipping frequency_kirchhoff_imaging_bf_gmres: ButterflyPACK float or SuperLU is unavailable")

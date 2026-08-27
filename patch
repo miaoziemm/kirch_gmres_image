@@ -1,0 +1,1652 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/SELINEAR/CMakeLists.txt b/SELINEAR/CMakeLists.txt
+index 17e68155734d784964dcc1fc9fc1c83b3bdfa925..a2cbb19084e437dca877ef7ca07845e8bebdcfd1 100644
+--- a/SELINEAR/CMakeLists.txt
++++ b/SELINEAR/CMakeLists.txt
+@@ -1,27 +1,28 @@
+ set(SELINEAR_HEADERS
+     include/global_preconditioned_gmres.hpp
++    include/reference_global_gmres.hpp
+     include/se_eigen.hpp
+     include/se_eigen_solver.hpp
+     include/se_eigen_solver_impl.hpp
+     include/se_eigen_complex_dispatch.hpp
+ )
+ 
+ set(SELINEAR_SOURCES
+     src/se_eigen_solver.cpp
+ )
+ 
+ add_library(selinear STATIC ${SELINEAR_SOURCES} ${SELINEAR_HEADERS})
+ add_library(Kirch::selinear ALIAS selinear)
+ 
+ set_target_properties(selinear PROPERTIES
+     OUTPUT_NAME selinear
+     POSITION_INDEPENDENT_CODE ON
+ )
+ 
+ target_include_directories(selinear
+     PUBLIC
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/SELINEAR/include>
+ )
+ 
+ target_link_libraries(selinear
+diff --git a/SELINEAR/include/reference_global_gmres.hpp b/SELINEAR/include/reference_global_gmres.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..111d2131cc47a7472f25807083464cf7e6779216
+--- /dev/null
++++ b/SELINEAR/include/reference_global_gmres.hpp
+@@ -0,0 +1,164 @@
++#ifndef GLOBAL_PRECONDITIONED_GMRES_HPP
++#define GLOBAL_PRECONDITIONED_GMRES_HPP
++
++#include <Eigen/Core>
++#include <Eigen/QR>
++#include <Eigen/SparseCore>
++
++#include <algorithm>
++#include <cmath>
++#include <complex>
++#include <limits>
++#include <utility>
++#include <vector>
++
++namespace global_preconditioned_gmres {
++
++using Complex = std::complex<double>;
++using Sparse = Eigen::SparseMatrix<Complex, Eigen::ColMajor, int>;
++using Vector = Eigen::Matrix<Complex, Eigen::Dynamic, 1>;
++using Triplet = Eigen::Triplet<Complex, int>;
++
++constexpr double kPi = 3.14159265358979323846;
++constexpr int kPml = 25;
++constexpr int kDefaultRestart = 30;
++constexpr int kDefaultOuter = 10;
++constexpr double kTolerance = 1.0e-12;
++
++inline int index(int iz, int ix, int nx)
++{
++    return iz * nx + ix;
++}
++
++inline double damping(int iz, int ix, int nz, int nx)
++{
++    const int distance = std::min({iz, nz - 1 - iz, ix, nx - 1 - ix});
++    if (distance >= kPml) return 0.0;
++
++    const double t = static_cast<double>(kPml - distance) / kPml;
++    return 2.0 * t * t;
++}
++
++inline void add_second_derivative(std::vector<Triplet>& terms,
++                                  int row, int coordinate,
++                                  int count, int stride, double h)
++{
++    const double scale = 1.0 / (h * h);
++    const auto add = [&](int offset, double value) {
++        terms.emplace_back(row, row + offset * stride, Complex(value * scale));
++    };
++
++    if (coordinate < 4 || coordinate + 4 >= count) {
++        if (coordinate == 0) {
++            add(0, 2.0); add(1, -5.0); add(2, 4.0); add(3, -1.0);
++        } else if (coordinate == count - 1) {
++            add(-3, -1.0); add(-2, 4.0); add(-1, -5.0); add(0, 2.0);
++        } else {
++            add(-1, 1.0); add(0, -2.0); add(1, 1.0);
++        }
++        return;
++    }
++
++    add(-4, -1.0 / 560.0);
++    add(-3,  8.0 / 315.0);
++    add(-2, -1.0 / 5.0);
++    add(-1,  8.0 / 5.0);
++    add( 0, -205.0 / 72.0);
++    add( 1,  8.0 / 5.0);
++    add( 2, -1.0 / 5.0);
++    add( 3,  8.0 / 315.0);
++    add( 4, -1.0 / 560.0);
++}
++
++inline Sparse build_helmholtz(const std::vector<float>& velocity,
++                              int nz, int nx, double dz, double dx,
++                              double frequency, bool adjoint_operator = false)
++{
++    const double omega = 2.0 * kPi * frequency;
++    std::vector<Triplet> terms;
++    terms.reserve(static_cast<std::size_t>(17) * nz * nx);
++
++    for (int iz = 0; iz < nz; ++iz) {
++        for (int ix = 0; ix < nx; ++ix) {
++            const int row = index(iz, ix, nx);
++            const double k2 = std::pow(omega / velocity[row], 2.0);
++
++            add_second_derivative(terms, row, iz, nz, nx, dz);
++            add_second_derivative(terms, row, ix, nx, 1, dx);
++            const double pml = k2 * damping(iz, ix, nz, nx);
++            // The receiver spectrum is conjugated before continuation, so
++            // its global correction uses the adjoint Helmholtz operator.  The
++            // imaging condition subsequently correlates source with the
++            // conjugate of this corrected receiver field.
++            terms.emplace_back(
++                row, row, Complex(k2, adjoint_operator ? -pml : pml));
++        }
++    }
++
++    Sparse matrix(nz * nx, nz * nx);
++    matrix.setFromTriplets(terms.begin(), terms.end());
++    matrix.makeCompressed();
++    return matrix;
++}
++
++struct Result {
++    Vector field;
++    int steps = 0;
++    double residual_before = 0.0;
++    double residual_after = 0.0;
++};
++
++inline Result solve(const Sparse& matrix, const Vector& rhs,
++                    const Vector& initial, int restart, int outer)
++{
++    const double rhs_norm = std::max(
++        rhs.norm(), std::numeric_limits<double>::epsilon());
++
++    Vector field = initial;
++    Vector residual = rhs - matrix * field;
++    const double residual_before = residual.norm();
++    int steps = 0;
++    const int max_iterations = restart * outer;
++
++    while (steps < max_iterations &&
++           residual.norm() > kTolerance * rhs_norm) {
++        const int columns = std::min(restart, max_iterations - steps);
++        const double beta = residual.norm();
++        Eigen::MatrixXcd basis(rhs.size(), columns + 1);
++        Eigen::MatrixXcd hessenberg =
++            Eigen::MatrixXcd::Zero(columns + 1, columns);
++        basis.col(0) = residual / beta;
++
++        int used = 0;
++        for (int j = 0; j < columns; ++j) {
++            Vector w = matrix * basis.col(j);
++            for (int i = 0; i <= j; ++i) {
++                const Complex h = basis.col(i).dot(w);
++                hessenberg(i, j) = h;
++                w -= h * basis.col(i);
++            }
++
++            const double hnext = w.norm();
++            hessenberg(j + 1, j) = hnext;
++            used = j + 1;
++            if (hnext <= std::numeric_limits<double>::epsilon()) break;
++            basis.col(j + 1) = w / hnext;
++        }
++
++        Vector g = Vector::Zero(used + 1);
++        g[0] = beta;
++        const Vector y = hessenberg.topLeftCorner(used + 1, used)
++                             .householderQr()
++                             .solve(g);
++        field += basis.leftCols(used) * y;
++        residual = rhs - matrix * field;
++        steps += used;
++    }
++
++    return {std::move(field), steps,
++            residual_before / rhs_norm, residual.norm() / rhs_norm};
++}
++
++} // namespace global_preconditioned_gmres
++
++#endif
+\ No newline at end of file
+diff --git a/script/test_single_shot_f_image_rtm_kirch.sh b/script/test_single_shot_f_image_rtm_kirch.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..1465a58d7175ebd87f6f2fcc9f83d982f4c1a853
+--- /dev/null
++++ b/script/test_single_shot_f_image_rtm_kirch.sh
+@@ -0,0 +1,194 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# ============================================================================
++# 1. Paths: normally only BUILD_DIR and WORK_DIR need to be changed.
++# ============================================================================
++ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++BUILD_DIR="${ROOT_DIR}/build"
++BIN_DIR="${BUILD_DIR}/bin"
++MODEL="${ROOT_DIR}/model/vmar.rsf"
++WORK_DIR="${ROOT_DIR}/single_shot_f_image_rtm_kirch_test"
++
++# ============================================================================
++# 2. Runtime resources.
++# ============================================================================
++THREADS=32
++MAX_TABLE_MB=8192
++
++# ============================================================================
++# 3. Single-shot forward-modeling parameters (coordinates use model units).
++# ============================================================================
++NT=4500
++DT=0.0007
++FDOM=20
++SX=5.3715
++SZ=0.0105
++RZ=0.0105
++NR=1024
++R0=0.0
++DR=0.0105
++NBC=40
++LAPLACE_TYPE=0                 # 0=FD8, 1=pseudospectral
++
++# ============================================================================
++# 4. Model-block and traveltime-table parameters.
++#    The same strides are passed to traveltime calculation and imaging.
++# ============================================================================
++FIRST_BLOCK_ROWS=20
++BLOCK_ROWS=50
++OVERLAP_ROWS=10
++SOURCE_STRIDE=1
++TARGET_X_STRIDE=1
++TARGET_Z_STRIDE=1
++
++# Velocity smoothing used only by traveltime calculation and imaging.
++SMOOTH_SIGMA=4
++
++# Direct-wave front mute applied to the synthetic shot gather.
++DIRECT_VELOCITY=1.5
++DIRECT_EXTRA_TIME=0.08
++DIRECT_TAPER_TIME=0.04
++
++# ============================================================================
++# 5. Frequency-domain imaging and ButterflyPACK parameters.
++# ============================================================================
++FMIN=1
++FMAX=80
++FREQUENCY_STRIDE=1
++BPACK_TOL=1e-4
++BPACK_LEAF=64
++GMRES_ITERATIONS=10
++GMRES_RESTART=30
++
++# Derived output names. They normally do not need modification.
++SHOT_DATA="${WORK_DIR}/single_shot.rsf"
++MUTED_SHOT_DATA="${WORK_DIR}/single_shot_muted.rsf"
++IMAGING_MODEL="${WORK_DIR}/vmar_smooth.rsf"
++BLOCK_FILE="${WORK_DIR}/huygens_blocks.txt"
++TABLE_PREFIX="${WORK_DIR}/traveltime/travel"
++IMAGE="${WORK_DIR}/single_shot_image.rsf"
++ILLUMINATION="${WORK_DIR}/single_shot_illumination.rsf"
++TIMING="${WORK_DIR}/single_shot_timing.rsf"
++IMAGE_NO_GMRES="${WORK_DIR}/single_shot_image_no_gmres.rsf"
++ILLUMINATION_NO_GMRES="${WORK_DIR}/single_shot_illumination_no_gmres.rsf"
++TIMING_NO_GMRES="${WORK_DIR}/single_shot_timing_no_gmres.rsf"
++
++# Start every test with an empty output directory.
++rm -rf "${WORK_DIR}"
++mkdir -p "${WORK_DIR}/traveltime"
++cd "${ROOT_DIR}"
++
++# Check the four programs before starting a potentially expensive test.
++for program in sewave2d_forward smooth_velocity_model mute_direct_wave \
++               huygens_block_info travel_time_solver \
++               f_image_rtm_kirch; do
++    if [[ ! -x "${BIN_DIR}/${program}" ]]; then
++        echo "Missing executable: ${BIN_DIR}/${program}" >&2
++        echo "Configure and build the project first." >&2
++        exit 1
++    fi
++done
++
++# ----------------------------------------------------------------------------
++# Step 1: generate one synthetic shot gather from model/vmar.rsf.
++# ----------------------------------------------------------------------------
++echo "[1/6] Forward modeling one shot with the original velocity model"
++OMP_NUM_THREADS="${THREADS}" "${BIN_DIR}/sewave2d_forward" \
++    velocity="${MODEL}" output="${SHOT_DATA}" \
++    ns=1 nt="${NT}" dt="${DT}" fdom="${FDOM}" \
++    sx="${SX}" sz="${SZ}" rz="${RZ}" \
++    nr="${NR}" r0="${R0}" dr="${DR}" nbc="${NBC}" \
++    type_compute_Laplace="${LAPLACE_TYPE}"
++
++# ----------------------------------------------------------------------------
++# Step 2: remove the direct-wave arrival from the synthetic record.
++# ----------------------------------------------------------------------------
++echo "[2/6] Muting the direct wave"
++"${BIN_DIR}/mute_direct_wave" input="${SHOT_DATA}" output="${MUTED_SHOT_DATA}" \
++    direct_velocity="${DIRECT_VELOCITY}" source_depth="${SZ}" \
++    receiver_depth="${RZ}" extra_time="${DIRECT_EXTRA_TIME}" \
++    taper_time="${DIRECT_TAPER_TIME}"
++
++# ----------------------------------------------------------------------------
++# Step 3: create the smooth model used by traveltime calculation and imaging.
++# The forward record above always uses the original model.
++# ----------------------------------------------------------------------------
++echo "[3/6] Smoothing the velocity model"
++"${BIN_DIR}/smooth_velocity_model" \
++    input="${MODEL}" output="${IMAGING_MODEL}" sigma="${SMOOTH_SIGMA}"
++
++# ----------------------------------------------------------------------------
++# Step 4: divide the smooth velocity model into propagation blocks.
++# ----------------------------------------------------------------------------
++echo "[4/6] Building the Huygens block description"
++"${BIN_DIR}/huygens_block_info" \
++    velocity="${IMAGING_MODEL}" output="${BLOCK_FILE}" \
++    first_block_rows="${FIRST_BLOCK_ROWS}" block_rows="${BLOCK_ROWS}" \
++    overlap_rows="${OVERLAP_ROWS}"
++
++# ----------------------------------------------------------------------------
++# Step 5: calculate tables for ButterflyPACK blocks. Block zero uses analytic
++# phase-shift initialization and needs no table. The remaining tables include
++# overlap rows used by Scheme-A blending.
++# ----------------------------------------------------------------------------
++echo "[5/6] Calculating traveltime tables with the smooth model"
++"${BIN_DIR}/travel_time_solver" \
++    velocity="${IMAGING_MODEL}" block_file="${BLOCK_FILE}" \
++    output_prefix="${TABLE_PREFIX}" \
++    timing="${WORK_DIR}/traveltime_timing.rsf" \
++    include_propagation_overlap=1 source_stride="${SOURCE_STRIDE}" \
++    target_x_stride="${TARGET_X_STRIDE}" target_z_stride="${TARGET_Z_STRIDE}" \
++    threads="${THREADS}" max_table_mb="${MAX_TABLE_MB}"
++
++# ----------------------------------------------------------------------------
++# Step 6: image only shot 0. ButterflyPACK computes the receiver wavefield;
++# global GMRES corrects both wavefields before cross-correlation imaging.
++# ----------------------------------------------------------------------------
++echo "[6/6] Imaging shot 0 and writing per-frequency fields"
++OMP_NUM_THREADS="${THREADS}" "${BIN_DIR}/f_image_rtm_kirch" \
++    velocity="${IMAGING_MODEL}" seismic_data="${MUTED_SHOT_DATA}" cmp=0 \
++    block_file="${BLOCK_FILE}" table_prefix="${TABLE_PREFIX}" \
++    shot_begin=0 shot_count=1 shot_stride=1 \
++    fdom="${FDOM}" fmin="${FMIN}" fmax="${FMAX}" \
++    frequency_stride="${FREQUENCY_STRIDE}" \
++    source_stride="${SOURCE_STRIDE}" target_x_stride="${TARGET_X_STRIDE}" \
++    target_z_stride="${TARGET_Z_STRIDE}" threads="${THREADS}" \
++    bpack_tol="${BPACK_TOL}" bpack_leaf="${BPACK_LEAF}" \
++    global_source_z="${SZ}" global_source_correction_z0=0.105 \
++    gmres_outer="${GMRES_ITERATIONS}" gmres_restart="${GMRES_RESTART}" \
++    image_before_correction="${IMAGE_NO_GMRES}" \
++    illumination_before_correction="${ILLUMINATION_NO_GMRES}" \
++    source_wavefield_output_dir="${WORK_DIR}/frequency_fields" \
++    image="${IMAGE}" illumination="${ILLUMINATION}" timing="${TIMING}"
++
++# ButterflyPACK uses a Fortran STOP for internal NaNs, which may return status
++# zero on some compilers.  Require the final image so such a stop cannot be
++# mistaken for a successful Step 6.
++if [[ ! -s "${IMAGE}" || ! -s "${IMAGE_NO_GMRES}" ]]; then
++    echo "Imaging did not create both before/after images" >&2
++    exit 1
++fi
++
++# Every selected frequency must have all four diagnostic wavefields.  Each
++# complex field is stored as a real/imaginary RSF pair by the C++ executable.
++FIELD_COUNT=0
++for field in source_ray source_gmres receiver_kirchhoff receiver_gmres; do
++    count=$(find "${WORK_DIR}/frequency_fields" -maxdepth 1 \
++        -type f -name "${field}_*.rsf" | wc -l)
++    if [[ "${count}" -eq 0 ]]; then
++        echo "No ${field} frequency diagnostics were written" >&2
++        exit 1
++    fi
++    if [[ "${FIELD_COUNT}" -ne 0 && "${count}" -ne "${FIELD_COUNT}" ]]; then
++        echo "Incomplete per-frequency diagnostics for ${field}" >&2
++        exit 1
++    fi
++    FIELD_COUNT="${count}"
++done
++
++echo "Single-shot reference-compatible imaging completed."
++echo "Image before correction: ${IMAGE_NO_GMRES}"
++echo "Image after correction:  ${IMAGE}"
++echo "Per-frequency fields:    ${WORK_DIR}/frequency_fields"
++echo "All outputs:             ${WORK_DIR}"
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index af4e9a697bcebac5e7d38aa1d4ed0dcdf0246f80..96fc98e8a41bb0911698a2cea07243c8bc159910 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -13,36 +13,48 @@ endfunction()
+ kirch_add_application(huygens_block_info huygens_block_info.cpp)
+ target_link_libraries(huygens_block_info PRIVATE Kirch::reckirch)
+ 
+ kirch_add_application(travel_time_solver travel_time_solver.cpp)
+ target_link_libraries(travel_time_solver PRIVATE Kirch::reckirch)
+ 
+ # Time-domain acoustic forward modelling.  SEWAVE is not a standalone CMake
+ # library in this repository, so compile its implementation into this target.
+ kirch_add_application(sewave2d_forward
+     sewave2d_forward.cpp
+     "${PROJECT_SOURCE_DIR}/SEWAVE/sewave2d.cpp")
+ target_link_libraries(sewave2d_forward
+     PRIVATE Kirch::sebasic Kirch::sefs ${KIRCH_FFTW_FLOAT_TARGET})
+ 
+ foreach(_wave_utility IN ITEMS smooth_velocity_model mute_direct_wave)
+     kirch_add_application(${_wave_utility}
+         ${_wave_utility}.cpp
+         "${PROJECT_SOURCE_DIR}/SEWAVE/sewave2d.cpp")
+     target_link_libraries(${_wave_utility}
+         PRIVATE Kirch::sebasic Kirch::sefs ${KIRCH_FFTW_FLOAT_TARGET})
+ endforeach()
+ 
+ # The production imaging executable constructs complex-float ButterflyPACK
+ # matrices, and therefore must not be offered by configurations which disable
+ # that backend.
++if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float)
++    # This target intentionally uses the reference restarted-GMRES algorithm,
++    # which only requires Eigen and does not use the production SuperLU path.
++    kirch_add_application(f_image_rtm_kirch f_image_rtm_kirch.cpp)
++    target_link_libraries(f_image_rtm_kirch
++        PRIVATE Kirch::reckirch Kirch::selinear Kirch::eigen)
++else()
++    message(STATUS
++        "Skipping f_image_rtm_kirch: ButterflyPACK float is unavailable")
++endif()
++
+ if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float
+    AND TARGET Kirch::SuperLU)
+     kirch_add_application(frequency_kirchhoff_imaging_bf_gmres
+         frequency_kirchhoff_imaging_bf_gmres.cpp
+         ${PROJECT_SOURCE_DIR}/SERECKIRCH/src/global_bf_imaging_workflow.cpp)
+     target_link_libraries(frequency_kirchhoff_imaging_bf_gmres
+         PRIVATE Kirch::reckirch Kirch::eigen Kirch::SuperLU)
++
+ else()
+     message(STATUS
+         "Skipping frequency_kirchhoff_imaging_bf_gmres: ButterflyPACK float or SuperLU is unavailable")
+ endif()
+diff --git a/src/f_image_rtm_kirch.cpp b/src/f_image_rtm_kirch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5f2b903f4d977499e4432b0ea2e1672e5ac1622
+--- /dev/null
++++ b/src/f_image_rtm_kirch.cpp
+@@ -0,0 +1,1096 @@
++#include <SERECKIRCH/include/frequency_kirchhoff_imaging_common.hpp>
++#include <reference_global_gmres.hpp>
++#include "program_help.hpp"
++
++#include <SERECKIRCH/include/efmm.h>
++#include <SERECKIRCH/include/se_butterfly.hpp>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <complex>
++#include <exception>
++#include <filesystem>
++#include <iomanip>
++#include <iostream>
++#include <limits>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace fki = frequency_kirchhoff_imaging;
++namespace gpg = global_preconditioned_gmres;
++
++namespace {
++
++constexpr const char* kProgramName =
++    "f_image_rtm_kirch";
++constexpr double kRayPhase = -0.75 * gpg::kPi;
++constexpr double kOverlapAmplitudeFloor = 1.0e-3;
++constexpr double kOverlapScaleCap = 2.0;
++
++std::vector<fki::Complex> frequency_boundary(
++    const std::vector<fki::Complex>& field, std::size_t frequency, int nx)
++{
++    const std::size_t first = frequency * static_cast<std::size_t>(nx);
++    return {field.begin() + first, field.begin() + first + nx};
++}
++
++std::vector<fki::Complex> depth_major(
++    const std::vector<fki::Complex>& x_major, int nx, int nz)
++{
++    std::vector<fki::Complex> result(static_cast<std::size_t>(nx) * nz);
++    for (int ix = 0; ix < nx; ++ix) {
++        for (int iz = 0; iz < nz; ++iz) {
++            result[static_cast<std::size_t>(iz) * nx + ix] =
++                x_major[static_cast<std::size_t>(ix) * nz + iz];
++        }
++    }
++    return result;
++}
++
++se::huygens::Block receiver_propagation_block(
++    const se::huygens::BlockInfo& blocks, std::size_t block_index)
++{
++    se::huygens::Block block =
++        fki::imaging_propagation_block(blocks, block_index);
++
++    // The block file stores contiguous official output intervals.  For every
++    // recursive block, recompute the rows immediately below its datum so that
++    // the two neighboring Kirchhoff fields share physical samples to align.
++    if (block_index > 0 && blocks.overlap_rows > 0) {
++        const int shared_start = block.source_iz + 1;
++        if (shared_start < block.target_start_iz)
++            block.target_start_iz = shared_start;
++    }
++    return block;
++}
++
++std::vector<int> shared_depths(const std::vector<int>& first,
++                               const std::vector<int>& second)
++{
++    std::vector<int> result;
++    std::size_t i = 0;
++    std::size_t j = 0;
++    while (i < first.size() && j < second.size()) {
++        if (first[i] < second[j]) {
++            ++i;
++        } else if (second[j] < first[i]) {
++            ++j;
++        } else {
++            result.push_back(first[i]);
++            ++i;
++            ++j;
++        }
++    }
++    return result;
++}
++
++int local_depth(const std::vector<int>& depths, int iz)
++{
++    const auto found = std::lower_bound(depths.begin(), depths.end(), iz);
++    return found == depths.end() || *found != iz
++        ? -1
++        : static_cast<int>(std::distance(depths.begin(), found));
++}
++
++struct ReceiverOverlap {
++    int nx = 0;
++    std::size_t frequency_count = 0;
++    std::vector<int> depths;
++    std::vector<fki::Complex> field;
++
++    bool empty() const { return depths.empty(); }
++
++    std::size_t index(std::size_t shot, std::size_t frequency,
++                      std::size_t depth, int ix) const
++    {
++        return (((shot * frequency_count + frequency) * depths.size() + depth) *
++                    static_cast<std::size_t>(nx) + ix);
++    }
++};
++
++ReceiverOverlap make_receiver_overlap(const std::vector<int>& depths, int nx,
++                                      std::size_t shot_count,
++                                      std::size_t frequency_count)
++{
++    ReceiverOverlap overlap;
++    overlap.nx = nx;
++    overlap.frequency_count = frequency_count;
++    overlap.depths = depths;
++    overlap.field.assign(shot_count * frequency_count * depths.size() *
++                         static_cast<std::size_t>(nx),
++                         fki::Complex(0.0f, 0.0f));
++    return overlap;
++}
++
++void blend_receiver_overlap(const ReceiverOverlap& previous,
++                            std::size_t shot, std::size_t frequency,
++                            const std::vector<int>& target_iz,
++                            std::vector<fki::Complex>& current)
++{
++    if (previous.empty()) return;
++
++    double maximum_amplitude = 0.0;
++    for (std::size_t idepth = 0; idepth < previous.depths.size(); ++idepth) {
++        const int current_iz = local_depth(target_iz, previous.depths[idepth]);
++        if (current_iz < 0) continue;
++        for (int ix = 0; ix < previous.nx; ++ix) {
++            const fki::Complex old_value = previous.field[
++                previous.index(shot, frequency, idepth, ix)];
++            const fki::Complex new_value = current[
++                static_cast<std::size_t>(current_iz) * previous.nx + ix];
++            maximum_amplitude = std::max(
++                maximum_amplitude,
++                std::max(static_cast<double>(std::abs(old_value)),
++                         static_cast<double>(std::abs(new_value))));
++        }
++    }
++
++    const double amplitude_floor =
++        kOverlapAmplitudeFloor * maximum_amplitude;
++    std::complex<double> numerator(0.0, 0.0);
++    double denominator = 0.0;
++    for (std::size_t idepth = 0; idepth < previous.depths.size(); ++idepth) {
++        const int current_iz = local_depth(target_iz, previous.depths[idepth]);
++        if (current_iz < 0) continue;
++        for (int ix = 0; ix < previous.nx; ++ix) {
++            const fki::Complex old_value = previous.field[
++                previous.index(shot, frequency, idepth, ix)];
++            const fki::Complex new_value = current[
++                static_cast<std::size_t>(current_iz) * previous.nx + ix];
++            const std::complex<double> old_field(
++                old_value.real(), old_value.imag());
++            const std::complex<double> new_field(
++                new_value.real(), new_value.imag());
++            if (std::abs(old_field) < amplitude_floor ||
++                std::abs(new_field) < amplitude_floor) {
++                continue;
++            }
++            numerator += std::conj(new_field) * old_field;
++            denominator += std::norm(new_field);
++        }
++    }
++
++    std::complex<double> scale(1.0, 0.0);
++    if (denominator > std::numeric_limits<double>::min()) {
++        scale = numerator / denominator;
++        if (!std::isfinite(scale.real()) || !std::isfinite(scale.imag()) ||
++            std::abs(scale) < std::numeric_limits<double>::min()) {
++            scale = std::complex<double>(1.0, 0.0);
++        }
++    }
++
++    const double raw_scale_magnitude = std::abs(scale);
++    if (raw_scale_magnitude > kOverlapScaleCap) {
++        scale *= kOverlapScaleCap / raw_scale_magnitude;
++    } else if (raw_scale_magnitude < 1.0 / kOverlapScaleCap) {
++        scale *= 1.0 / (kOverlapScaleCap * raw_scale_magnitude);
++    }
++
++    const double scale_magnitude = std::abs(scale);
++    const double scale_phase = std::arg(scale);
++    for (std::size_t idepth = 0; idepth < previous.depths.size(); ++idepth) {
++        const int current_iz = local_depth(target_iz, previous.depths[idepth]);
++        if (current_iz < 0) continue;
++
++        const double new_weight = previous.depths.size() == 1
++            ? 0.5
++            : static_cast<double>(idepth) /
++                  static_cast<double>(previous.depths.size() - 1);
++        const double old_weight = 1.0 - new_weight;
++        const std::complex<double> local_scale = std::polar(
++            std::pow(scale_magnitude, old_weight), scale_phase * old_weight);
++
++        for (int ix = 0; ix < previous.nx; ++ix) {
++            const fki::Complex old_value = previous.field[
++                previous.index(shot, frequency, idepth, ix)];
++            const std::size_t current_index =
++                static_cast<std::size_t>(current_iz) * previous.nx + ix;
++            const fki::Complex new_value = current[current_index];
++            const std::complex<double> fused =
++                old_weight * std::complex<double>(
++                    old_value.real(), old_value.imag()) +
++                new_weight * local_scale * std::complex<double>(
++                    new_value.real(), new_value.imag());
++            current[current_index] = fki::Complex(
++                static_cast<float>(fused.real()),
++                static_cast<float>(fused.imag()));
++        }
++    }
++}
++
++void store_receiver_overlap(const std::vector<int>& target_iz,
++                            const std::vector<fki::Complex>& field,
++                            std::size_t shot, std::size_t frequency,
++                            ReceiverOverlap& overlap)
++{
++    for (std::size_t idepth = 0; idepth < overlap.depths.size(); ++idepth) {
++        const int current_iz = local_depth(target_iz, overlap.depths[idepth]);
++        if (current_iz < 0) continue;
++        for (int ix = 0; ix < overlap.nx; ++ix) {
++            overlap.field[overlap.index(shot, frequency, idepth, ix)] =
++                field[static_cast<std::size_t>(current_iz) * overlap.nx + ix];
++        }
++    }
++}
++
++std::vector<fki::Complex> phase_shift(
++    const se::huygens::Model2D& model, const se::huygens::Block& block,
++    const std::vector<int>& target_iz, float frequency,
++    const std::vector<fki::Complex>& boundary)
++{
++    const int nx = model.nx;
++    std::vector<fki::Complex> spectrum = boundary;
++    fftwf_plan forward = fftwf_plan_dft_1d(
++        nx, reinterpret_cast<fftwf_complex*>(spectrum.data()),
++        reinterpret_cast<fftwf_complex*>(spectrum.data()),
++        FFTW_FORWARD, FFTW_ESTIMATE);
++    fftwf_execute(forward);
++    fftwf_destroy_plan(forward);
++
++    double mean_velocity = 0.0;
++    for (const int iz : target_iz) {
++        for (int ix = 0; ix < nx; ++ix)
++            mean_velocity += model.velocity[model.index(ix, iz)];
++    }
++    mean_velocity /= static_cast<double>(target_iz.size() * nx);
++
++    const double k0 = 2.0 * gpg::kPi * frequency / mean_velocity;
++    std::vector<fki::Complex> result(
++        static_cast<std::size_t>(target_iz.size()) * nx);
++    std::vector<fki::Complex> line(static_cast<std::size_t>(nx));
++    fftwf_plan inverse = fftwf_plan_dft_1d(
++        nx, reinterpret_cast<fftwf_complex*>(line.data()),
++        reinterpret_cast<fftwf_complex*>(line.data()),
++        FFTW_BACKWARD, FFTW_ESTIMATE);
++
++    for (std::size_t iz = 0; iz < target_iz.size(); ++iz) {
++        const double distance = model.z(target_iz[iz]) - model.z(block.source_iz);
++        for (int ik = 0; ik < nx; ++ik) {
++            const int signed_k = ik <= nx / 2 ? ik : ik - nx;
++            const double kx = 2.0 * gpg::kPi * signed_k / (nx * model.dx);
++            const double kz2 = k0 * k0 - kx * kx;
++            const fki::Complex propagator = kz2 >= 0.0
++                ? std::exp(fki::Complex(0.0f,
++                    static_cast<float>(-std::sqrt(kz2) * distance)))
++                : fki::Complex(static_cast<float>(
++                    std::exp(-std::sqrt(-kz2) * std::abs(distance))), 0.0f);
++            line[ik] = spectrum[ik] * propagator;
++        }
++
++        fftwf_execute(inverse);
++        for (int ix = 0; ix < nx; ++ix)
++            result[iz * static_cast<std::size_t>(nx) + ix] =
++                line[ix] / static_cast<float>(nx);
++    }
++
++    fftwf_destroy_plan(inverse);
++    return result;
++}
++
++void save_receiver_boundary(const se::huygens::Model2D& model,
++                            std::size_t frequency,
++                            const std::vector<int>& target_iz, int next_iz,
++                            const std::vector<fki::Complex>& field,
++                            fki::ShotBoundaryState& state)
++{
++    const int local_iz = fki::find_local_depth(target_iz, next_iz);
++    if (local_iz < 0) return;
++
++    for (int ix = 0; ix < model.nx; ++ix) {
++        state.receiver_conjugate[frequency *
++            static_cast<std::size_t>(model.nx) + ix] =
++            field[static_cast<std::size_t>(local_iz) * model.nx + ix];
++    }
++}
++
++std::size_t receiver_index(std::size_t shot, std::size_t frequency,
++                           std::size_t grid, std::size_t frequency_count,
++                           std::size_t grid_size)
++{
++    return (shot * frequency_count + frequency) * grid_size + grid;
++}
++
++void save_receiver_block(const se::huygens::Model2D& model,
++                         const std::vector<int>& target_iz,
++                         const std::vector<fki::Complex>& field,
++                         std::size_t shot, std::size_t frequency,
++                         std::size_t frequency_count,
++                         std::vector<fki::Complex>& receiver_kirchhoff_field)
++{
++    const std::size_t grid_size =
++        static_cast<std::size_t>(model.nx) * model.nz;
++    for (std::size_t iz = 0; iz < target_iz.size(); ++iz) {
++        for (int ix = 0; ix < model.nx; ++ix) {
++            receiver_kirchhoff_field[receiver_index(
++                shot, frequency, model.index(ix, target_iz[iz]),
++                frequency_count, grid_size)] =
++                field[iz * static_cast<std::size_t>(model.nx) + ix];
++        }
++    }
++}
++
++int nearest_index(float coordinate, float origin, float step, int count)
++{
++    return std::clamp(
++        static_cast<int>(std::lround((coordinate - origin) / step)),
++        0, count - 1);
++}
++
++enum class EfmmLayout { zfast, xfast };
++
++std::size_t efmm_index(EfmmLayout layout, int iz, int ix, int nz, int nx)
++{
++    return layout == EfmmLayout::zfast
++        ? static_cast<std::size_t>(ix) * nz + iz
++        : static_cast<std::size_t>(iz) * nx + ix;
++}
++
++std::vector<float> efmm_velocity(const se::huygens::Model2D& model,
++                                 EfmmLayout layout)
++{
++    std::vector<float> velocity(
++        static_cast<std::size_t>(model.nx) * model.nz);
++    for (int iz = 0; iz < model.nz; ++iz) {
++        for (int ix = 0; ix < model.nx; ++ix) {
++            velocity[efmm_index(layout, iz, ix, model.nz, model.nx)] =
++                model.velocity[model.index(ix, iz)];
++        }
++    }
++    return velocity;
++}
++
++EfmmLayout detect_efmm_layout(const std::vector<float>& time,
++                              int nz, int nx, int source_iz, int source_ix)
++{
++    const float minimum = *std::min_element(time.begin(), time.end());
++    const float tolerance = std::max(1.0e-7f, 1.0e-4f * std::abs(minimum));
++    const bool zfast = std::abs(time[efmm_index(
++        EfmmLayout::zfast, source_iz, source_ix, nz, nx)] - minimum) <= tolerance;
++    const bool xfast = std::abs(time[efmm_index(
++        EfmmLayout::xfast, source_iz, source_ix, nz, nx)] - minimum) <= tolerance;
++    if (zfast == xfast) {
++        throw std::runtime_error("cannot determine eFMM travel-time layout");
++    }
++    return zfast ? EfmmLayout::zfast : EfmmLayout::xfast;
++}
++
++std::vector<float> source_traveltime(
++    const se::huygens::Model2D& model, int source_ix, int source_iz)
++{
++    const auto solve = [&](EfmmLayout layout) {
++        efmm_t solver{};
++        if (efmm_init(&solver, model.nx, model.nz, model.dx, model.dz,
++                      source_ix * model.dx, source_iz * model.dz) != 0) {
++            throw std::runtime_error("efmm_init failed");
++        }
++        try {
++            std::vector<float> velocity = efmm_velocity(model, layout);
++            if (efmm_set_vel(&solver, velocity.data()) != 0 ||
++                efmm_solver(&solver) != 0) {
++                throw std::runtime_error("eFMM solve failed");
++            }
++            std::vector<float> time(
++                solver.tt, solver.tt + static_cast<std::size_t>(model.nx) * model.nz);
++            efmm_free(&solver);
++            return time;
++        } catch (...) {
++            efmm_free(&solver);
++            throw;
++        }
++    };
++
++    std::vector<float> raw = solve(EfmmLayout::zfast);
++    EfmmLayout layout = detect_efmm_layout(
++        raw, model.nz, model.nx, source_iz, source_ix);
++    if (layout != EfmmLayout::zfast) {
++        raw = solve(layout);
++        layout = detect_efmm_layout(
++            raw, model.nz, model.nx, source_iz, source_ix);
++    }
++
++    std::vector<float> time(
++        static_cast<std::size_t>(model.nx) * model.nz);
++    for (int iz = 0; iz < model.nz; ++iz) {
++        for (int ix = 0; ix < model.nx; ++ix) {
++            time[model.index(ix, iz)] =
++                raw[efmm_index(layout, iz, ix, model.nz, model.nx)];
++        }
++    }
++    return time;
++}
++
++gpg::Vector point_ray(const se::huygens::Model2D& model,
++                      const std::vector<float>& time, float frequency,
++                      gpg::Complex source, int source_ix, int source_iz)
++{
++    const double omega = 2.0 * gpg::kPi * frequency;
++    const double tmin = std::max(model.dx, model.dz) /
++        model.velocity[model.index(source_ix, source_iz)];
++    const gpg::Complex discrete_source = source *
++        (static_cast<double>(model.dx) * model.dz);
++    gpg::Vector field(static_cast<Eigen::Index>(model.nx) * model.nz);
++
++    for (int iz = 0; iz < model.nz; ++iz) {
++        for (int ix = 0; ix < model.nx; ++ix) {
++            const double travel_time =
++                std::max(0.0, static_cast<double>(time[model.index(ix, iz)]));
++            const double effective_time = std::max(travel_time, tmin);
++            const double amplitude =
++                1.0 / std::sqrt(8.0 * gpg::kPi * omega * effective_time);
++            field[gpg::index(iz, ix, model.nx)] = discrete_source *
++                std::polar(amplitude, omega * travel_time + kRayPhase);
++        }
++    }
++    return field;
++}
++
++std::vector<float> pad_velocity(const se::huygens::Model2D& model)
++{
++    const int nz = model.nz + 2 * gpg::kPml;
++    const int nx = model.nx + 2 * gpg::kPml;
++    std::vector<float> padded(static_cast<std::size_t>(nz) * nx);
++
++    for (int iz = 0; iz < nz; ++iz) {
++        const int physical_iz = std::clamp(iz - gpg::kPml, 0, model.nz - 1);
++        for (int ix = 0; ix < nx; ++ix) {
++            const int physical_ix = std::clamp(ix - gpg::kPml, 0, model.nx - 1);
++            padded[gpg::index(iz, ix, nx)] =
++                model.velocity[model.index(physical_ix, physical_iz)];
++        }
++    }
++    return padded;
++}
++
++gpg::Vector pad_field(const gpg::Vector& field, int nz, int nx)
++{
++    const int padded_nz = nz + 2 * gpg::kPml;
++    const int padded_nx = nx + 2 * gpg::kPml;
++    gpg::Vector padded(static_cast<Eigen::Index>(padded_nz) * padded_nx);
++
++    for (int iz = 0; iz < padded_nz; ++iz) {
++        const int physical_iz = std::clamp(iz - gpg::kPml, 0, nz - 1);
++        for (int ix = 0; ix < padded_nx; ++ix) {
++            const int physical_ix = std::clamp(ix - gpg::kPml, 0, nx - 1);
++            padded[gpg::index(iz, ix, padded_nx)] =
++                field[gpg::index(physical_iz, physical_ix, nx)];
++        }
++    }
++    return padded;
++}
++
++gpg::Vector crop_field(const gpg::Vector& padded, int nz, int nx)
++{
++    const int padded_nx = nx + 2 * gpg::kPml;
++    gpg::Vector field(static_cast<Eigen::Index>(nz) * nx);
++
++    for (int iz = 0; iz < nz; ++iz) {
++        for (int ix = 0; ix < nx; ++ix) {
++            field[gpg::index(iz, ix, nx)] =
++                padded[gpg::index(iz + gpg::kPml, ix + gpg::kPml, padded_nx)];
++        }
++    }
++    return field;
++}
++
++gpg::Vector lower_mask(const gpg::Vector& field, int nz, int nx,
++                       int first_iz)
++{
++    gpg::Vector masked = gpg::Vector::Zero(field.size());
++    for (int iz = first_iz; iz < nz; ++iz) {
++        for (int ix = 0; ix < nx; ++ix) {
++            masked[gpg::index(iz, ix, nx)] = field[gpg::index(iz, ix, nx)];
++        }
++    }
++    return masked;
++}
++
++struct FieldCorrection {
++    gpg::Vector field;
++    gpg::Vector update;
++    int steps = 0;
++    double residual_before = 0.0;
++    double residual_after = 0.0;
++};
++
++gpg::Vector receiver_kirchhoff_vector(
++    const se::huygens::Model2D& model,
++    const std::vector<fki::Complex>& receiver_kirchhoff_field,
++    std::size_t offset)
++{
++    gpg::Vector field(static_cast<Eigen::Index>(model.nx) * model.nz);
++    for (int iz = 0; iz < model.nz; ++iz) {
++        for (int ix = 0; ix < model.nx; ++ix) {
++            const fki::Complex value =
++                receiver_kirchhoff_field[offset + model.index(ix, iz)];
++            field[gpg::index(iz, ix, model.nx)] =
++                gpg::Complex(value.real(), value.imag());
++        }
++    }
++    return field;
++}
++
++FieldCorrection correct_global_field(const gpg::Sparse& matrix,
++                                     const gpg::Vector& input_field,
++                                     int nz, int nx, int correction_iz,
++                                     int restart, int outer)
++{
++    const int padded_nz = nz + 2 * gpg::kPml;
++    const int padded_nx = nx + 2 * gpg::kPml;
++    const int padded_correction_iz = correction_iz + gpg::kPml;
++    const gpg::Vector padded_field = pad_field(input_field, nz, nx);
++    const gpg::Vector initial = lower_mask(
++        padded_field, padded_nz, padded_nx, padded_correction_iz);
++    const gpg::Vector a_field = matrix * padded_field;
++    const gpg::Vector rhs = matrix * initial - lower_mask(
++        a_field, padded_nz, padded_nx, padded_correction_iz);
++    const gpg::Result result = gpg::solve(
++        matrix, rhs, initial, restart, outer);
++    const gpg::Vector solved = crop_field(result.field, nz, nx);
++
++    gpg::Vector corrected = input_field;
++    for (int iz = correction_iz; iz < nz; ++iz) {
++        for (int ix = 0; ix < nx; ++ix) {
++            corrected[gpg::index(iz, ix, nx)] =
++                solved[gpg::index(iz, ix, nx)];
++        }
++    }
++    return {corrected, corrected - input_field, result.steps,
++            result.residual_before, result.residual_after};
++}
++
++void write_field(const std::filesystem::path& directory,
++                 const se::huygens::Model2D& model, const gpg::Vector& field,
++                 int shot, std::size_t frequency_index, float frequency,
++                 const char* name)
++{
++    const std::size_t size = static_cast<std::size_t>(model.nx) * model.nz;
++    std::vector<float> real(size), imag(size);
++    for (int iz = 0; iz < model.nz; ++iz) {
++        for (int ix = 0; ix < model.nx; ++ix) {
++            const gpg::Complex value = field[gpg::index(iz, ix, model.nx)];
++            const std::size_t grid = model.index(ix, iz);
++            real[grid] = static_cast<float>(value.real());
++            imag[grid] = static_cast<float>(value.imag());
++        }
++    }
++
++    std::ostringstream stem;
++    stem << name << "_shot" << shot
++         << "_ifreq" << frequency_index + 1
++         << "_f" << std::fixed << std::setprecision(6) << frequency << "Hz";
++    se::huygens::write_image_rsf(
++        (directory / (stem.str() + "_real.rsf")).string(), model, real,
++        std::string(name) + "_real");
++    se::huygens::write_image_rsf(
++        (directory / (stem.str() + "_imag.rsf")).string(), model, imag,
++        std::string(name) + "_imag");
++}
++
++void write_traveltime(const std::filesystem::path& directory,
++                      const se::huygens::Model2D& model,
++                      const std::vector<float>& time, int shot)
++{
++    se::huygens::write_image_rsf(
++        (directory / ("source_traveltime_shot" + std::to_string(shot) +
++                      ".rsf")).string(),
++        model, time, "point_source_traveltime");
++}
++
++} // namespace
++
++int main(int argc, char** argv)
++{
++    if (kirch_help::show_if_requested(argc, argv)) return 0;
++
++    try {
++        huygens_cli::initialize(argc, argv);
++        const fki::CommonOptions options = fki::parse_common_options(kProgramName);
++        huygens_cli::set_openmp_threads(options.threads);
++
++        const se::huygens::Model2D model =
++            se::huygens::read_velocity_model(options.velocity);
++        const se::huygens::BlockInfo blocks =
++            se::huygens::read_block_info(options.block_file);
++        se::huygens::validate_block_info(blocks, &model);
++
++        const int source_iz = nearest_index(
++            huygens_cli::optional_float("global_source_z", model.oz),
++            model.oz, model.dz, model.nz);
++        const int correction_iz = nearest_index(
++            huygens_cli::optional_float(
++                "global_source_correction_z0",
++                model.oz + std::min(model.nz - 1, source_iz + 30) * model.dz),
++            model.oz, model.dz, model.nz);
++        const int gmres_restart = huygens_cli::optional_int(
++            "gmres_restart", gpg::kDefaultRestart);
++        const int gmres_outer = huygens_cli::optional_int(
++            "gmres_outer", gpg::kDefaultOuter);
++        const float bpack_tolerance = huygens_cli::optional_float(
++            "bpack_tol", 1.0e-4f);
++        const int bpack_leaf_size = huygens_cli::optional_int(
++            "bpack_leaf", 64);
++        const int bpack_verbosity = huygens_cli::optional_int(
++            "bpack_verbosity", -1);
++        const int bpack_lr_level = huygens_cli::optional_int(
++            "bpack_lrlevel", 100);
++        const float bpack_sample_parameter = huygens_cli::optional_float(
++            "bpack_sample_para", 1.5f);
++        const int bpack_forward_n15 = huygens_cli::optional_int(
++            "bpack_forward_n15", 0);
++        const int bpack_knn = huygens_cli::optional_int("bpack_knn", 0);
++        const int bpack_pattern_compression = huygens_cli::optional_int(
++            "bpack_pat_comp", 1);
++        const int bpack_less_adapt = huygens_cli::optional_int(
++            "bpack_less_adapt", 1);
++        const float bpack_rank_detection_factor = huygens_cli::optional_float(
++            "bpack_rdetect_factor", 0.3f);
++        const int bpack_reuse_tree = huygens_cli::optional_int(
++            "bpack_reuse_tree", 1);
++        const int bpack_progress = huygens_cli::optional_int(
++            "bpack_progress", 1);
++        const int bpack_progress_every = huygens_cli::optional_int(
++            "bpack_progress_every", 1);
++        if (gmres_restart < 1 || gmres_outer < 1) {
++            throw std::invalid_argument(
++                "gmres_restart and gmres_outer must both be positive");
++        }
++        if (bpack_tolerance <= 0.0f || bpack_leaf_size < 1 ||
++            bpack_lr_level < 0 || bpack_sample_parameter <= 0.0f ||
++            bpack_rank_detection_factor <= 0.0f ||
++            bpack_progress_every < 1) {
++            throw std::invalid_argument("invalid Butterfly parameter");
++        }
++        const std::string field_output =
++            huygens_cli::optional_string("source_wavefield_output_dir", "");
++        const std::string image_before_correction =
++            huygens_cli::optional_string("image_before_correction", "");
++        const std::string illumination_before_correction =
++            huygens_cli::optional_string(
++                "illumination_before_correction", "");
++
++        fki::SeismicData data(options.seismic_data, options.cmp != 0);
++        const fki::FrequencyAxis axis = fki::make_frequency_axis(data, options);
++        const std::vector<int> shots = fki::selected_shots(data, options);
++        const std::vector<float> weights = fki::full_boundary_weights(model);
++        const std::vector<fki::Complex> source_spectrum = fki::ricker_spectrum(
++            data, axis, options.fdom, options.source_time, options.source_amplitude);
++
++        std::cout << "Global source/receiver GMRES: restart=" << gmres_restart
++                  << ", outer=" << gmres_outer
++                  << ", max steps=" << gmres_restart * gmres_outer
++                  << ", z0=" << model.z(correction_iz) << '\n';
++
++        double fft_seconds = 0.0;
++        int skipped_receivers = 0;
++        std::vector<fki::ShotBoundaryState> states;
++        states.reserve(shots.size());
++        for (const int shot : shots) {
++            states.push_back(fki::initialize_shot_state(
++                data, shot, model, options, axis, source_spectrum, weights,
++                fft_seconds, skipped_receivers));
++        }
++
++        const std::size_t grid_size =
++            static_cast<std::size_t>(model.nx) * model.nz;
++        const std::size_t frequency_count = axis.frequencies.size();
++        // This array holds the complete receiver Kirchhoff continuation for
++        // every shot, frequency, and physical depth before GMRES is invoked.
++        std::vector<fki::Complex> receiver_kirchhoff_field(
++            states.size() * frequency_count * grid_size,
++            fki::Complex(0.0f, 0.0f));
++        // Keep the two imaging conditions separate for a direct comparison:
++        // ray/Kirchhoff before GMRES and source/receiver after GMRES.
++        std::vector<float> image_before_correction_field(grid_size, 0.0f);
++        std::vector<float> illumination_before_correction_field(
++            grid_size, 0.0f);
++        std::vector<float> image_after_correction(grid_size, 0.0f);
++        std::vector<float> illumination_after_correction(grid_size, 0.0f);
++        std::vector<float> timing(4 * blocks.blocks.size(), 0.0f);
++
++        const se::butterfly::Options butterfly_options = [&] {
++            se::butterfly::Options options;
++            options.tolerance = bpack_tolerance;
++            options.leaf_size = bpack_leaf_size;
++            options.verbosity = bpack_verbosity;
++            options.coordinate_dimension = 2;
++            options.lr_level = bpack_lr_level;
++            options.sample_parameter = bpack_sample_parameter;
++            options.forward_n15_flag = bpack_forward_n15;
++            options.nearest_neighbors = bpack_knn;
++            options.compression_pattern = bpack_pattern_compression;
++            options.less_adapt = bpack_less_adapt;
++            options.rank_detection_factor = bpack_rank_detection_factor;
++            options.reuse_geometry = bpack_reuse_tree;
++            return options;
++        }();
++
++        double total_filter_seconds = 0.0;
++        double total_build_seconds = 0.0;
++        double total_apply_seconds = 0.0;
++
++        std::vector<std::vector<int>> receiver_block_depths(
++            blocks.blocks.size());
++        for (std::size_t iblock = 0; iblock < blocks.blocks.size(); ++iblock) {
++            const se::huygens::Block block =
++                receiver_propagation_block(blocks, iblock);
++            receiver_block_depths[iblock] =
++                se::huygens::make_layer_geometry(
++                    model, block, options.source_stride,
++                    options.target_x_stride, options.target_z_stride).target_iz;
++        }
++        ReceiverOverlap previous_receiver_overlap;
++
++        // Original recursive receiver continuation: the surface near block
++        // uses its homogeneous one-way phase shift; every following block is
++        // the Kirchhoff integral evaluated by a Butterfly matrix.  Neighboring
++        // blocks recompute their shared rows, then align and blend them before
++        // accepting either field into the complete receiver wavefield.
++        for (std::size_t iblock = 0; iblock < blocks.blocks.size(); ++iblock) {
++            const se::huygens::Block block =
++                receiver_propagation_block(blocks, iblock);
++            const se::huygens::LayerGeometry geometry =
++                se::huygens::make_layer_geometry(
++                    model, block, options.source_stride,
++                    options.target_x_stride, options.target_z_stride);
++            const bool first_block = iblock == 0;
++            se::huygens::OneWayLayerTables tables;
++            // Block zero is propagated analytically by phase_shift() below.
++            // travel_time_solver therefore intentionally starts its files at
++            // block 001, and no block_000 table should be opened here.
++            if (!first_block) {
++                tables = se::huygens::read_one_way_layer_tables(
++                    options.table_prefix, block.id);
++                se::huygens::validate_one_way_layer_tables(
++                    tables, geometry, block);
++            }
++            const float maximum_time = first_block ? 0.0f :
++                *std::max_element(tables.traveltime.values.begin(),
++                                  tables.traveltime.values.end());
++            const float filter_dt = options.filter_dt > 0.0f
++                ? options.filter_dt : data.dt();
++
++            std::vector<double> rows;
++            std::vector<double> columns;
++            if (!first_block) {
++                rows.reserve(2 * geometry.targets.size());
++                for (const auto& point : geometry.targets) {
++                    rows.push_back(model.ox + point.ix * model.dx);
++                    rows.push_back(model.oz + point.iz * model.dz);
++                }
++                columns.reserve(2 * geometry.source_ix.size());
++                for (const int ix : geometry.source_ix) {
++                    columns.push_back(model.ox + ix * model.dx);
++                    columns.push_back(model.z(block.source_iz));
++                }
++            }
++
++            double filter_seconds = 0.0;
++            double build_seconds = 0.0;
++            double apply_seconds = 0.0;
++
++            ReceiverOverlap next_receiver_overlap;
++            if (iblock + 1 < blocks.blocks.size()) {
++                next_receiver_overlap = make_receiver_overlap(
++                    shared_depths(receiver_block_depths[iblock],
++                                  receiver_block_depths[iblock + 1]),
++                    model.nx, states.size(), frequency_count);
++            }
++
++            for (std::size_t ifrequency = 0;
++                 ifrequency < frequency_count; ++ifrequency) {
++                const float frequency = axis.frequencies[ifrequency];
++                std::vector<std::vector<fki::Complex>> propagated;
++
++                const bool print_progress = bpack_progress != 0 &&
++                    (ifrequency % static_cast<std::size_t>(bpack_progress_every) == 0 ||
++                     ifrequency + 1 == frequency_count);
++                if (print_progress) {
++                    std::cout << "Receiver Kirchhoff: block=" << block.id
++                              << ", frequency=" << ifrequency + 1 << '/'
++                              << frequency_count << ", f=" << frequency << " Hz, ";
++                    if (first_block) {
++                        std::cout << "phase shift (no Butterfly build)\n";
++                    } else {
++                        std::cout << "building Butterfly matrix once\n";
++                    }
++                }
++
++                double frequency_build_seconds = 0.0;
++                double frequency_apply_seconds = 0.0;
++
++                if (first_block) {
++                    propagated.reserve(states.size());
++                    for (const auto& state : states) {
++                        propagated.push_back(phase_shift(
++                            model, block, geometry.target_iz, frequency,
++                            frequency_boundary(
++                                state.receiver_conjugate, ifrequency, model.nx)));
++                    }
++                } else {
++                    const auto filter_start = fki::Clock::now();
++                    const se::huygens::FrequencyKirchhoffFilter filter(
++                        frequency, filter_dt, options.filter_length,
++                        maximum_time, options.filter_lookup_subsamples);
++                    filter_seconds += std::chrono::duration<double>(
++                        fki::Clock::now() - filter_start).count();
++
++                    se::huygens::OneWayKernelData kernel;
++                    kernel.rows = static_cast<int>(geometry.targets.size());
++                    kernel.sources = static_cast<int>(geometry.source_ix.size());
++                    kernel.source_z = model.z(block.source_iz);
++                    kernel.quadrature_weights = &weights;
++                    kernel.tables = &tables;
++                    kernel.filter = &filter;
++
++                    std::vector<std::vector<fki::Complex>> input;
++                    input.reserve(states.size());
++                    for (const auto& state : states) {
++                        input.push_back(frequency_boundary(
++                            state.receiver_conjugate, ifrequency, model.nx));
++                    }
++
++                    const auto build_start = fki::Clock::now();
++                    se::butterfly::Matrix<float> butterfly(
++                        kernel.rows, kernel.sources, rows, columns,
++                        [&kernel](int row, int source) {
++                            return kernel.entry(row, source);
++                        },
++                        butterfly_options);
++                    frequency_build_seconds = std::chrono::duration<double>(
++                        fki::Clock::now() - build_start).count();
++                    build_seconds += frequency_build_seconds;
++
++                    const auto apply_start = fki::Clock::now();
++                    const std::vector<std::vector<fki::Complex>> output =
++                        butterfly.apply_many(input);
++                    frequency_apply_seconds = std::chrono::duration<double>(
++                        fki::Clock::now() - apply_start).count();
++                    apply_seconds += frequency_apply_seconds;
++
++                    propagated.reserve(output.size());
++                    for (const auto& field : output) {
++                        propagated.push_back(
++                            depth_major(field, model.nx,
++                                        static_cast<int>(geometry.target_iz.size())));
++                    }
++                }
++
++                if (print_progress) {
++                    std::cout << "Receiver Kirchhoff: block=" << block.id
++                              << ", frequency=" << ifrequency + 1 << '/'
++                              << frequency_count << ", f=" << frequency << " Hz done";
++                    if (!first_block) {
++                        std::cout << ", Butterfly build=" << frequency_build_seconds
++                                  << " s, apply=" << frequency_apply_seconds
++                                  << " s";
++                    }
++                    std::cout << '\n';
++                }
++
++                for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
++                    blend_receiver_overlap(
++                        previous_receiver_overlap, ishot, ifrequency,
++                        geometry.target_iz, propagated[ishot]);
++                    save_receiver_block(
++                        model, geometry.target_iz, propagated[ishot], ishot,
++                        ifrequency, frequency_count, receiver_kirchhoff_field);
++                    store_receiver_overlap(
++                        geometry.target_iz, propagated[ishot], ishot,
++                        ifrequency, next_receiver_overlap);
++                    if (iblock + 1 < blocks.blocks.size()) {
++                        save_receiver_boundary(
++                            model, ifrequency, geometry.target_iz,
++                            blocks.blocks[iblock + 1].source_iz,
++                            propagated[ishot], states[ishot]);
++                    }
++                }
++            }
++
++            timing[4 * iblock] = static_cast<float>(filter_seconds);
++            timing[4 * iblock + 1] = static_cast<float>(build_seconds);
++            timing[4 * iblock + 2] = static_cast<float>(apply_seconds);
++            timing[4 * iblock + 3] =
++                static_cast<float>(filter_seconds + build_seconds + apply_seconds);
++            total_filter_seconds += filter_seconds;
++            total_build_seconds += build_seconds;
++            total_apply_seconds += apply_seconds;
++            previous_receiver_overlap = std::move(next_receiver_overlap);
++        }
++
++        std::filesystem::path output_directory;
++        if (!field_output.empty()) {
++            output_directory = field_output;
++            std::filesystem::create_directories(output_directory);
++        }
++
++        std::vector<int> source_ix(states.size());
++        std::vector<std::vector<float>> traveltime(states.size());
++        for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
++            source_ix[ishot] = nearest_index(
++                states[ishot].shot_x, model.ox, model.dx, model.nx);
++            traveltime[ishot] =
++                source_traveltime(model, source_ix[ishot], source_iz);
++            if (!field_output.empty()) {
++                write_traveltime(
++                    output_directory, model, traveltime[ishot], shots[ishot]);
++            }
++        }
++
++        const std::vector<float> velocity = pad_velocity(model);
++        const int padded_nz = model.nz + 2 * gpg::kPml;
++        const int padded_nx = model.nx + 2 * gpg::kPml;
++
++        for (std::size_t ifrequency = 0;
++             ifrequency < frequency_count; ++ifrequency) {
++            const float frequency = axis.frequencies[ifrequency];
++            const gpg::Sparse source_matrix = gpg::build_helmholtz(
++                velocity, padded_nz, padded_nx, model.dz, model.dx, frequency);
++            const gpg::Sparse receiver_matrix = gpg::build_helmholtz(
++                velocity, padded_nz, padded_nx, model.dz, model.dx, frequency,
++                true);
++
++            for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
++                // The point-ray kernel carries the positive outgoing phase.
++                // With the forward-FFT Ricker spectrum S(w), conj(S(w))
++                // therefore represents U_s^*: the conjugated source field
++                // needed by the conventional frequency-domain condition.
++                const gpg::Complex source = std::conj(gpg::Complex(
++                    source_spectrum[ifrequency].real(),
++                    source_spectrum[ifrequency].imag()));
++                const gpg::Vector ray = point_ray(
++                    model, traveltime[ishot], frequency, source,
++                    source_ix[ishot], source_iz);
++                const FieldCorrection source_corrected = correct_global_field(
++                    source_matrix, ray, model.nz, model.nx, correction_iz,
++                    gmres_restart, gmres_outer);
++
++                const std::size_t offset = receiver_index(
++                    ishot, ifrequency, 0, frequency_count, grid_size);
++                // GMRES starts only after the complete recursive Kirchhoff /
++                // Butterfly receiver field has been assembled above.
++                const gpg::Vector receiver_kirchhoff =
++                    receiver_kirchhoff_vector(
++                        model, receiver_kirchhoff_field, offset);
++                const FieldCorrection receiver_corrected = correct_global_field(
++                    receiver_matrix, receiver_kirchhoff, model.nz, model.nx,
++                    correction_iz, gmres_restart, gmres_outer);
++
++                std::cout << "shot=" << shots[ishot]
++                          << " f=" << frequency
++                          << " source=" << source_corrected.steps
++                          << " (" << source_corrected.residual_before
++                          << " -> " << source_corrected.residual_after << ')'
++                          << " receiver=" << receiver_corrected.steps
++                          << " (" << receiver_corrected.residual_before
++                          << " -> " << receiver_corrected.residual_after << ')'
++                          << '\n';
++
++                if (!field_output.empty()) {
++                    write_field(output_directory, model, ray, shots[ishot],
++                                ifrequency, frequency, "source_ray");
++                    write_field(output_directory, model, source_corrected.field,
++                                shots[ishot], ifrequency, frequency,
++                                "source_gmres");
++                    write_field(output_directory, model, source_corrected.update,
++                                shots[ishot], ifrequency, frequency,
++                                "source_update");
++                    write_field(output_directory, model, receiver_kirchhoff,
++                                shots[ishot], ifrequency, frequency,
++                                "receiver_kirchhoff");
++                    write_field(output_directory, model, receiver_corrected.field,
++                                shots[ishot], ifrequency, frequency,
++                                "receiver_gmres");
++                    write_field(output_directory, model, receiver_corrected.update,
++                                shots[ishot], ifrequency, frequency,
++                                "receiver_update");
++                }
++
++                const float weight = axis.imaging_weights[ifrequency];
++                for (int iz = 0; iz < model.nz; ++iz) {
++                    for (int ix = 0; ix < model.nx; ++ix) {
++                        const int local = gpg::index(iz, ix, model.nx);
++                        const std::size_t grid = model.index(ix, iz);
++                        const gpg::Complex source_before = ray[local];
++                        const gpg::Complex receiver_before =
++                            receiver_kirchhoff[local];
++                        // receiver_kirchhoff starts from conj(D), is continued
++                        // with the adjoint (negative-phase) receiver operator,
++                        // and is therefore U_r^*.  The source ray is U_s^*.
++                        // Conventional imaging is Re{U_s^* U_r}; conjugate
++                        // the stored receiver field exactly once here.
++                        image_before_correction_field[grid] +=
++                            weight * static_cast<float>(
++                                (source_before * std::conj(receiver_before)).real());
++                        illumination_before_correction_field[grid] +=
++                            weight * static_cast<float>(std::norm(source_before));
++
++                        const gpg::Complex source_after =
++                            source_corrected.field[local];
++                        const gpg::Complex receiver_after =
++                            receiver_corrected.field[local];
++                        image_after_correction[grid] += weight * static_cast<float>(
++                            (source_after * std::conj(receiver_after)).real());
++                        illumination_after_correction[grid] +=
++                            weight * static_cast<float>(std::norm(source_after));
++                    }
++                }
++            }
++        }
++
++        // Keep the conventional, unnormalized frequency-domain
++        // cross-correlation.  Illumination is written only for diagnosis.
++        if (!image_before_correction.empty()) {
++            se::huygens::write_image_rsf(
++                image_before_correction, model, image_before_correction_field,
++                "source_ray_receiver_kirchhoff_cross_correlation",
++                {{"frequency_min_hz", axis.frequencies.front()},
++                 {"frequency_max_hz", axis.frequencies.back()},
++                 {"frequency_count", static_cast<float>(frequency_count)},
++                 {"shot_count", static_cast<float>(states.size())}});
++        }
++        if (!illumination_before_correction.empty()) {
++            se::huygens::write_image_rsf(
++                illumination_before_correction, model,
++                illumination_before_correction_field,
++                "source_ray_illumination");
++        }
++        se::huygens::write_image_rsf(
++            options.image, model, image_after_correction,
++            "source_receiver_gmres_cross_correlation",
++            {{"frequency_min_hz", axis.frequencies.front()},
++             {"frequency_max_hz", axis.frequencies.back()},
++             {"frequency_count", static_cast<float>(frequency_count)},
++             {"shot_count", static_cast<float>(states.size())}});
++        if (!options.illumination.empty()) {
++            se::huygens::write_image_rsf(
++                options.illumination, model, illumination_after_correction,
++                "point_source_gmres_illumination");
++        }
++
++        se::huygens::write_timing_rsf(
++            options.timing, timing, 4, static_cast<int>(blocks.blocks.size()),
++            kProgramName,
++            {"filter_seconds", "bpack_build_seconds",
++             "bpack_apply_seconds", "total_seconds"},
++            {{"fft_seconds", static_cast<float>(fft_seconds)},
++             {"total_filter_seconds", static_cast<float>(total_filter_seconds)},
++             {"total_bpack_build_seconds", static_cast<float>(total_build_seconds)},
++             {"total_bpack_apply_seconds", static_cast<float>(total_apply_seconds)},
++             {"skipped_receiver_coordinates",
++              static_cast<float>(skipped_receivers)}});
++
++        if (!image_before_correction.empty()) {
++            std::cout << "Image before correction: "
++                      << image_before_correction << '\n';
++        }
++        std::cout << "Image after correction: " << options.image << '\n';
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << kProgramName << ": " << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/src/program_help.hpp b/src/program_help.hpp
+index 9634316f543264da7222b2224a7e9705f8aa4cdc..f1717cf36ea87b3fcea01796e470103aaac79417 100644
+--- a/src/program_help.hpp
++++ b/src/program_help.hpp
+@@ -682,50 +682,84 @@ RSF 数据。程序会检查时间步长稳定性。
+   output=FILE                   输出炮集，n1=time、n2=receiver、n3=shot
+ 
+ 主要可选参数
+ ------------
+   nt=N                          默认 6000
+   dt=SEC                        默认 0.0007
+   fdom=HZ                       默认 20
+   sx=X  sz=Z                    首炮震源坐标
+   ns=N  ds=D                    炮数和炮间距，默认 1、0
+   rz=Z  nr=N  r0=X  dr=D        检波线几何
+   nbc=N                         吸收边界宽度，默认 40
+   L=N                           空间算子长度，默认 30
+   alpha=A                       吸收边界强度，默认 1
+   type_compute_Laplace=0|1      0=FD8，1=伪谱；默认 0
+   flag_smooth=0|1               是否平滑速度模型，默认 0
+   flag_homo=0|1                 是否使用均匀模型，默认 0
+   progress_interval=N           进度输出间隔，默认 nt/10
+ 
+ 输出连接
+ --------
+   output 可直接作为 frequency_kirchhoff_imaging_bf_gmres 的
+   seismic_data=FILE 输入。
+ )KHELP";
+     }
+ 
++    if (program == "f_image_rtm_kirch") {
++        return R"KHELP(
++f_image_rtm_kirch
++=================
++功能
++----
++复刻参考点源频率域 Kirchhoff RTM 流程：递归 ButterflyPACK 检波波场、
++点源射线初场、全局 Helmholtz GMRES 矫正以及频率域互相关叠加成像。
++
++用法
++----
++  f_image_rtm_kirch velocity=MODEL.rsf block_file=BLOCKS.txt \
++      table_prefix=PREFIX seismic_data=DATA.rsf [key=value ...]
++
++关键参数
++--------
++  cmp=0|1 shot_begin=0 shot_count=-1 shot_stride=1
++  fdom=20 source_time=-1 source_amplitude=1
++  nfft=0 fmin=3 fmax=45 frequency_stride=1
++  global_source_z=Z global_source_correction_z0=Z
++  gmres_restart=30 gmres_outer=10
++      使用参考程序完全相同的无预条件 restarted GMRES、固定 25 点
++      吸收边界、1e-12 停止阈值和高阶 Helmholtz 空间离散。
++  bpack_tol=1e-4 bpack_leaf=64
++  image=FILE illumination=FILE timing=FILE
++  image_before_correction=FILE
++  illumination_before_correction=FILE
++  source_wavefield_output_dir=DIR
++      启用后，逐炮逐频率输出 source_ray、source_gmres、source_update、
++      receiver_kirchhoff、receiver_gmres 和 receiver_update 的实部与虚部
++      RSF；其中 ray/kirchhoff 是矫正前结果，gmres 是矫正后结果。
++)KHELP";
++    }
++
+     if (program == "frequency_kirchhoff_imaging_bf_gmres" ||
+         program == "frequency_kirchhoff_imaging_bf_global_gmres") {
+         return R"KHELP(
+ frequency_kirchhoff_imaging_bf_gmres
+ ====================================
+ 功能
+ ----
+ 仅保留生产全局矫正流程：由 eFMM 走时构造 A*exp(-i*omega*T) 震源初场，
+ 使用递归矩形 ButterflyPACK 计算检波波场，在完整模型上分别进行移位
+ Laplacian + SuperLU ILUTP 预条件 GMRES 全局矫正，最后互相关成像。
+ 
+ 用法
+ ----
+   frequency_kirchhoff_imaging_bf_gmres velocity=MODEL.rsf \
+       block_file=BLOCKS.txt table_prefix=PREFIX \
+       seismic_data=DATA.rsf [key=value ...]
+ 
+ 必选参数
+ --------
+   velocity=FILE                 二维 RSF 速度模型
+   block_file=FILE               huygens_block_info 的 output
+   table_prefix=PREFIX           逐块单向走时表前缀
+   seismic_data=FILE             正演或实测时间域炮集
+ 
+ 数据、频率与输出
+ 
+EOF
+)

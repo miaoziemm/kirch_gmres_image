@@ -704,6 +704,40 @@ RSF 数据。程序会检查时间步长稳定性。
 )KHELP";
     }
 
+    if (program == "f_image_rtm_kirch") {
+        return R"KHELP(
+f_image_rtm_kirch
+=================
+功能
+----
+复刻参考点源频率域 Kirchhoff RTM 流程：递归 ButterflyPACK 检波波场、
+点源射线初场、全局 Helmholtz GMRES 矫正以及频率域互相关叠加成像。
+
+用法
+----
+  f_image_rtm_kirch velocity=MODEL.rsf block_file=BLOCKS.txt \
+      table_prefix=PREFIX seismic_data=DATA.rsf [key=value ...]
+
+关键参数
+--------
+  cmp=0|1 shot_begin=0 shot_count=-1 shot_stride=1
+  fdom=20 source_time=-1 source_amplitude=1
+  nfft=0 fmin=3 fmax=45 frequency_stride=1
+  global_source_z=Z global_source_correction_z0=Z
+  gmres_restart=30 gmres_outer=10
+      使用参考程序完全相同的无预条件 restarted GMRES、固定 25 点
+      吸收边界、1e-12 停止阈值和高阶 Helmholtz 空间离散。
+  bpack_tol=1e-4 bpack_leaf=64
+  image=FILE illumination=FILE timing=FILE
+  image_before_correction=FILE
+  illumination_before_correction=FILE
+  source_wavefield_output_dir=DIR
+      启用后，逐炮逐频率输出 source_ray、source_gmres、source_update、
+      receiver_kirchhoff、receiver_gmres 和 receiver_update 的实部与虚部
+      RSF；其中 ray/kirchhoff 是矫正前结果，gmres 是矫正后结果。
+)KHELP";
+    }
+
     if (program == "frequency_kirchhoff_imaging_bf_gmres" ||
         program == "frequency_kirchhoff_imaging_bf_global_gmres") {
         return R"KHELP(
