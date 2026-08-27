@@ -68,3 +68,4 @@ vcpkg_installed/
 Testing/
 .cache/
 single_shot_f_image_rtm_kirch_test/
+ten_shot_f_image_rtm_kirch_test/

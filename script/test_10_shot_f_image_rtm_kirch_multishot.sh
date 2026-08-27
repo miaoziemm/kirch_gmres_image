@@ -60,7 +60,7 @@ SMOOTH_SIGMA=2
 
 # Keep the original direct-wave mute workflow.
 DIRECT_VELOCITY=1.5
-DIRECT_EXTRA_TIME=0.08
+DIRECT_EXTRA_TIME=0.2
 DIRECT_TAPER_TIME=0.04
 
 # ============================================================================
