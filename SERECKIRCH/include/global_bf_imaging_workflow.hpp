@@ -15,6 +15,7 @@ public:
 
     std::size_t shot_count() const;
     std::size_t frequency_count() const;
+    int frequency_parallelism() const;
 
     void calculate_receiver_wavefields();
     void begin_frequency(std::size_t frequency);
@@ -22,6 +23,7 @@ public:
     void iteratively_correct_wavefields(std::size_t shot, std::size_t frequency);
     void cross_correlate_image(std::size_t shot, std::size_t frequency);
     void end_frequency(std::size_t frequency);
+    void process_frequency(std::size_t frequency);
     void finish();
 
 private:

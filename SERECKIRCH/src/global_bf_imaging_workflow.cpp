@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -32,7 +33,7 @@ namespace {
 
 constexpr const char* kProgramName = "frequency_kirchhoff_imaging_bf_global_gmres";
 constexpr const char* kMethodDescription =
-    "Aexp source + recursive ButterflyPACK receiver + global shifted-Laplacian/ILUT GMRES";
+    "reference point-ray source + recursive ButterflyPACK receiver + unpreconditioned restarted GMRES";
 
 using PackedComplex = std::vector<float>;
 
@@ -631,7 +632,7 @@ void phase_shift_first_block(const se::huygens::Model2D& model,
 namespace gpg = global_preconditioned_gmres;
 
 std::vector<float> solve_global_source_traveltime(
-    const se::huygens::Model2D& model, float source_x)
+    const se::huygens::Model2D& model, float source_x, float source_z)
 {
     const float relative_x = source_x - model.ox;
     if (relative_x < -1.0e-4f ||
@@ -642,7 +643,7 @@ std::vector<float> solve_global_source_traveltime(
 
     efmm_t solver{};
     if (efmm_init(&solver, model.nx, model.nz, model.dx, model.dz,
-                  relative_x, 0.0f) != 0) {
+                  relative_x, source_z - model.oz) != 0) {
         throw std::runtime_error("efmm_init failed for global source field");
     }
     try {
@@ -682,41 +683,85 @@ gpg::Vector build_global_source_aexp(
     float frequency,
     fki::Complex source_spectrum,
     int source_ix,
-    double regularization)
+    int source_iz)
 {
     const std::size_t count =
         static_cast<std::size_t>(model.nx) * model.nz;
-    if (traveltime.size() != count || !(frequency > 0.0f) ||
-        !(regularization > 0.0)) {
+    if (traveltime.size() != count || !(frequency > 0.0f)) {
         throw std::invalid_argument("invalid global Aexp parameters");
     }
 
     const double omega = 2.0 * gpg::kPi * frequency;
-    const double source_velocity = static_cast<double>(
-        model.velocity[model.index(source_ix, 0)]);
-    const double minimum_time = regularization *
-        std::min(static_cast<double>(model.dx),
-                 static_cast<double>(model.dz)) /
-        std::max(source_velocity, 1.0);
-    const gpg::Complex spectrum(
+    const double minimum_time = std::max(model.dx, model.dz) /
+        model.velocity[model.index(source_ix, source_iz)];
+    const gpg::Complex spectrum = std::conj(gpg::Complex(
         static_cast<double>(source_spectrum.real()),
-        static_cast<double>(source_spectrum.imag()));
+        static_cast<double>(source_spectrum.imag()))) *
+        (static_cast<double>(model.dx) * model.dz);
 
     gpg::Vector field(static_cast<Eigen::Index>(count));
     for (int iz = 0; iz < model.nz; ++iz) {
         for (int ix = 0; ix < model.nx; ++ix) {
             const std::size_t grid = model.index(ix, iz);
-            const double t = std::max(
-                static_cast<double>(traveltime[grid]), minimum_time);
-            const double argument = std::max(omega * t, 1.0e-12);
-            const double amplitude =
-                std::sqrt(1.0 / (8.0 * gpg::kPi * argument));
-            const double phase = -(argument + 0.25 * gpg::kPi);
+            const double travel_time = std::max(
+                0.0, static_cast<double>(traveltime[grid]));
+            const double effective_time = std::max(travel_time, minimum_time);
+            const double amplitude = 1.0 /
+                std::sqrt(8.0 * gpg::kPi * omega * effective_time);
+            const double phase = omega * travel_time + 0.25 * gpg::kPi;
             field[static_cast<Eigen::Index>(grid)] =
                 spectrum * std::polar(amplitude, phase);
         }
     }
     return field;
+}
+
+gpg::Vector pad_global_field(const gpg::Vector& field, int nz, int nx)
+{
+    const int pnz = nz + 2 * gpg::kPml;
+    const int pnx = nx + 2 * gpg::kPml;
+    gpg::Vector padded(static_cast<Eigen::Index>(pnz) * pnx);
+    for (int iz = 0; iz < pnz; ++iz) {
+        const int piz = std::clamp(iz - gpg::kPml, 0, nz - 1);
+        for (int ix = 0; ix < pnx; ++ix) {
+            const int pix = std::clamp(ix - gpg::kPml, 0, nx - 1);
+            padded[gpg::index(iz, ix, pnx)] = field[gpg::index(piz, pix, nx)];
+        }
+    }
+    return padded;
+}
+
+gpg::Vector lower_global_mask(const gpg::Vector& field, int nz, int nx,
+                              int first_iz)
+{
+    gpg::Vector masked = gpg::Vector::Zero(field.size());
+    for (int iz = first_iz; iz < nz; ++iz)
+        for (int ix = 0; ix < nx; ++ix)
+            masked[gpg::index(iz, ix, nx)] = field[gpg::index(iz, ix, nx)];
+    return masked;
+}
+
+gpg::Vector reference_correct_field(const gpg::Sparse& matrix,
+                                    const gpg::Vector& input, int nz, int nx,
+                                    int correction_iz, int restart, int outer,
+                                    gpg::Result* metric)
+{
+    const int pnz = nz + 2 * gpg::kPml;
+    const int pnx = nx + 2 * gpg::kPml;
+    const int first = correction_iz + gpg::kPml;
+    const gpg::Vector padded = pad_global_field(input, nz, nx);
+    const gpg::Vector initial = lower_global_mask(padded, pnz, pnx, first);
+    const gpg::Vector rhs = matrix * initial -
+        lower_global_mask(matrix * padded, pnz, pnx, first);
+    gpg::Result result = gpg::solve(matrix, rhs, initial, restart, outer);
+    gpg::Vector corrected = input;
+    for (int iz = correction_iz; iz < nz; ++iz)
+        for (int ix = 0; ix < nx; ++ix)
+            corrected[gpg::index(iz, ix, nx)] =
+                result.field[gpg::index(iz + gpg::kPml,
+                                        ix + gpg::kPml, pnx)];
+    if (metric != nullptr) *metric = std::move(result);
+    return corrected;
 }
 
 class ReceiverBlockStore {
@@ -819,27 +864,31 @@ public:
         if (!writes_finalized_)
             throw std::logic_error("receiver store must be finalized before reading");
         gpg::Vector output = gpg::Vector::Zero(static_cast<Eigen::Index>(grid_size_));
+        std::vector<fki::Complex> read_buffer;
         for (Block& block : blocks_) {
-            read_buffer_.resize(block.values_per_record);
+            read_buffer.resize(block.values_per_record);
             const std::uint64_t record = frequency * shots_ + shot;
             const std::uint64_t value_offset = record * block.values_per_record;
             if (memory_backed_) {
                 std::copy_n(block.memory.begin() + static_cast<std::ptrdiff_t>(value_offset),
-                            block.values_per_record, read_buffer_.begin());
+                            block.values_per_record, read_buffer.begin());
             } else {
+                // std::fstream has shared seek state.  Keep only disk access
+                // serialized; GMRES and memory-backed loads remain parallel.
+                std::lock_guard<std::mutex> lock(read_mutex_);
                 const std::uint64_t byte_offset = value_offset * sizeof(fki::Complex);
                 block.stream.clear();
                 block.stream.seekg(static_cast<std::streamoff>(byte_offset));
-                block.stream.read(reinterpret_cast<char*>(read_buffer_.data()),
-                                  static_cast<std::streamsize>(read_buffer_.size() * sizeof(fki::Complex)));
+                block.stream.read(reinterpret_cast<char*>(read_buffer.data()),
+                                  static_cast<std::streamsize>(read_buffer.size() * sizeof(fki::Complex)));
                 if (!block.stream) throw std::runtime_error("receiver scratch read failed");
-                bytes_read_ += read_buffer_.size() * sizeof(fki::Complex);
+                bytes_read_ += read_buffer.size() * sizeof(fki::Complex);
             }
             for (std::size_t ld = 0; ld < block.depths.size(); ++ld) {
                 const int iz = block.depths[ld];
                 const double weight = block.weights[ld];
                 for (int ix = 0; ix < nx_; ++ix) {
-                    const fki::Complex value = read_buffer_[ld * static_cast<std::size_t>(nx_) + ix];
+                    const fki::Complex value = read_buffer[ld * static_cast<std::size_t>(nx_) + ix];
                     output[static_cast<Eigen::Index>(model.index(ix, iz))] +=
                         weight * gpg::Complex(value.real(), value.imag());
                 }
@@ -868,7 +917,7 @@ private:
     std::vector<Block> blocks_;
     bool memory_backed_ = false;
     bool writes_finalized_ = false;
-    std::vector<fki::Complex> read_buffer_;
+    std::mutex read_mutex_;
     std::uint64_t bytes_written_ = 0, bytes_read_ = 0;
 };
 
@@ -879,6 +928,7 @@ namespace kirch::imaging {
 struct GlobalBfImagingWorkflow::Impl {
     std::size_t shots = 0;
     std::size_t frequencies = 0;
+    int frequency_threads = 1;
     std::function<void()> calculate_receivers;
     std::function<void(std::size_t)> begin_frequency;
     std::function<void(std::size_t, std::size_t)> calculate_source;
@@ -897,12 +947,23 @@ GlobalBfImagingWorkflow& GlobalBfImagingWorkflow::operator=(
 GlobalBfImagingWorkflow::~GlobalBfImagingWorkflow() = default;
 std::size_t GlobalBfImagingWorkflow::shot_count() const { return impl_->shots; }
 std::size_t GlobalBfImagingWorkflow::frequency_count() const { return impl_->frequencies; }
+int GlobalBfImagingWorkflow::frequency_parallelism() const { return impl_->frequency_threads; }
 void GlobalBfImagingWorkflow::calculate_receiver_wavefields() { impl_->calculate_receivers(); }
 void GlobalBfImagingWorkflow::begin_frequency(std::size_t i) { impl_->begin_frequency(i); }
 void GlobalBfImagingWorkflow::calculate_source_wavefield(std::size_t s, std::size_t f) { impl_->calculate_source(s, f); }
 void GlobalBfImagingWorkflow::iteratively_correct_wavefields(std::size_t s, std::size_t f) { impl_->correct(s, f); }
 void GlobalBfImagingWorkflow::cross_correlate_image(std::size_t s, std::size_t f) { impl_->correlate(s, f); }
 void GlobalBfImagingWorkflow::end_frequency(std::size_t i) { impl_->end_frequency(i); }
+void GlobalBfImagingWorkflow::process_frequency(std::size_t frequency)
+{
+    begin_frequency(frequency);
+    for (std::size_t shot = 0; shot < shot_count(); ++shot) {
+        calculate_source_wavefield(shot, frequency);
+        iteratively_correct_wavefields(shot, frequency);
+        cross_correlate_image(shot, frequency);
+    }
+    end_frequency(frequency);
+}
 void GlobalBfImagingWorkflow::finish() { impl_->finish(); }
 
 int with_global_bf_imaging_workflow(
@@ -949,32 +1010,15 @@ int with_global_bf_imaging_workflow(
             huygens_cli::optional_float("bpack_geometry_cache_mb", 1024.0f);
         const int gmres_enable =
             huygens_cli::optional_int("gmres_enable", 1);
+        const int gmres_frequency_threads = huygens_cli::optional_int(
+            "gmres_frequency_threads", 0);
         const std::string correction_csv = huygens_cli::optional_string(
             "correction_csv", "global_gmres_metrics.csv");
 
-        gpg::Parameters global_correction;
-        global_correction.iterations = huygens_cli::optional_int(
-            "global_gmres_iterations", 10);
-        global_correction.restart = huygens_cli::optional_int(
-            "gmres_restart", 30);
-        global_correction.tolerance = huygens_cli::optional_float(
-            "gmres_tolerance", 1.0e-8f);
-        global_correction.absorbing_rows = huygens_cli::optional_int(
-            "gmres_nabs", 25);
-        global_correction.damp_max = huygens_cli::optional_float(
-            "gmres_damp_max", 2.0f);
-        global_correction.smooth_sigma = huygens_cli::optional_float(
-            "global_smooth_sigma", 1.0f);
-        global_correction.shift_beta = huygens_cli::optional_float(
-            "global_shift_beta", 0.30f);
-        global_correction.ilut_drop_tolerance = huygens_cli::optional_float(
-            "global_ilut_drop_tolerance", 0.03f);
-        global_correction.ilut_fill_factor = huygens_cli::optional_int(
-            "global_ilut_fill_factor", 12);
-        global_correction.ilut_pivot_threshold = huygens_cli::optional_float(
-            "global_ilut_pivot_threshold", 0.10f);
-        global_correction.receiver_mask_rows = huygens_cli::optional_int(
-            "global_receiver_mask_rows", 2);
+        const int gmres_outer = huygens_cli::optional_int(
+            "global_gmres_iterations", gpg::kDefaultOuter);
+        const int gmres_restart = huygens_cli::optional_int(
+            "gmres_restart", gpg::kDefaultRestart);
         const float global_storage_max_mb = huygens_cli::optional_float(
             "global_storage_max_mb", 8192.0f);
         const std::string receiver_store = huygens_cli::optional_string(
@@ -985,8 +1029,10 @@ int with_global_bf_imaging_workflow(
             "per_shot_image_dir", "");
         const float per_shot_image_max_mb = huygens_cli::optional_float(
             "per_shot_image_max_mb", 4096.0f);
-        const float global_source_regularization = huygens_cli::optional_float(
-            "global_source_regularization", 0.10f);
+        const float global_source_z = huygens_cli::optional_float(
+            "global_source_z", 0.0f);
+        const float global_source_correction_z0 = huygens_cli::optional_float(
+            "global_source_correction_z0", 0.105f);
 
         // Scheme-A seam controls.  seam_enable=0 reproduces the original
         // wavefield path (apart from the partition weights, which are also
@@ -1022,21 +1068,11 @@ int with_global_bf_imaging_workflow(
         if (gmres_enable != 0 && gmres_enable != 1) {
             throw std::invalid_argument("gmres_enable must be 0 or 1");
         }
-        if (global_correction.iterations < 1 ||
-            global_correction.restart < 1 ||
-            !(global_correction.tolerance > 0.0) ||
-            global_correction.absorbing_rows < 0 ||
-            !(global_correction.damp_max >= 0.0) ||
-            global_correction.smooth_sigma < 0.0 ||
-            !(global_correction.shift_beta >= 0.0) ||
-            !(global_correction.ilut_drop_tolerance > 0.0) ||
-            global_correction.ilut_fill_factor < 1 ||
-            !(global_correction.ilut_pivot_threshold >= 0.0) ||
-            global_correction.receiver_mask_rows < 1 ||
-            !(global_storage_max_mb > 0.0f) ||
-            !(global_source_regularization > 0.0f)) {
+        if (gmres_frequency_threads < 0)
+            throw std::invalid_argument("gmres_frequency_threads must be non-negative");
+        if (gmres_outer < 1 || gmres_restart < 1) {
             throw std::invalid_argument(
-                "invalid global shifted-Laplacian/ILUT GMRES parameters");
+                "global_gmres_iterations and gmres_restart must be positive");
         }
         if ((seam_enable != 0 && seam_enable != 1) ||
             seam_amp_rel_floor < 0.0f ||
@@ -1050,6 +1086,13 @@ int with_global_bf_imaging_workflow(
         const se::huygens::Model2D model =
             se::huygens::read_velocity_model(
                 options.velocity);
+        const int global_source_iz = std::clamp(
+            static_cast<int>(std::llround((global_source_z - model.oz) / model.dz)),
+            0, model.nz - 1);
+        const int global_correction_iz = std::clamp(
+            static_cast<int>(std::llround(
+                (global_source_correction_z0 - model.oz) / model.dz)),
+            global_source_iz, model.nz - 1);
         const se::huygens::BlockInfo info =
             se::huygens::read_block_info(
                 options.block_file);
@@ -1085,15 +1128,15 @@ int with_global_bf_imaging_workflow(
         std::cout
             << "Global GMRES         : "
             << (gmres_enable != 0 ? "enabled" : "disabled") << '\n'
-            << "Global iterations    : " << global_correction.iterations << '\n'
-            << "GMRES restart        : " << global_correction.restart << '\n'
-            << "GMRES tolerance      : " << global_correction.tolerance << '\n'
-            << "Velocity smooth sigma: " << global_correction.smooth_sigma << '\n'
-            << "Shifted-Lap beta     : " << global_correction.shift_beta << '\n'
-            << "ILUT drop/fill/pivot : "
-            << global_correction.ilut_drop_tolerance << "/"
-            << global_correction.ilut_fill_factor << "/"
-            << global_correction.ilut_pivot_threshold << '\n';
+            << "Global iterations    : " << gmres_outer << '\n'
+            << "Frequency threads    : "
+            << (gmres_frequency_threads > 0
+                    ? gmres_frequency_threads
+                    : std::min(options.threads > 0 ? options.threads : 4, 4)) << '\n'
+            << "GMRES restart        : " << gmres_restart << '\n'
+            << "Source/correction z  : " << model.z(global_source_iz) << "/"
+            << model.z(global_correction_iz) << '\n'
+            << "GMRES preconditioner : none (reference restarted GMRES)\n";
 
         std::cout
             << "Butterfly backend    : rectangular ButterflyPACK (one operator/frequency/block)\n"
@@ -1916,146 +1959,147 @@ int with_global_bf_imaging_workflow(
         std::vector<std::vector<float>> source_traveltimes(states.size());
         for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
             source_traveltimes[ishot] = solve_global_source_traveltime(
-                model, states[ishot].shot_x);
+                model, states[ishot].shot_x, model.z(global_source_iz));
         }
 
-        const std::vector<float> global_smoothed_velocity =
-            gpg::smooth_velocity(
-                model.velocity, model.nz, model.nx,
-                global_correction.smooth_sigma);
-        gpg::Parameters prepared_parameters = global_correction;
-        prepared_parameters.smooth_sigma = 0.0;
+        const int padded_nz = model.nz + 2 * gpg::kPml;
+        const int padded_nx = model.nx + 2 * gpg::kPml;
+        std::vector<float> padded_velocity(
+            static_cast<std::size_t>(padded_nz) * padded_nx);
+        for (int iz = 0; iz < padded_nz; ++iz) {
+            const int piz = std::clamp(iz - gpg::kPml, 0, model.nz - 1);
+            for (int ix = 0; ix < padded_nx; ++ix) {
+                const int pix = std::clamp(ix - gpg::kPml, 0, model.nx - 1);
+                padded_velocity[static_cast<std::size_t>(gpg::index(iz, ix, padded_nx))] =
+                    model.velocity[model.index(pix, piz)];
+            }
+        }
 
         double global_factor_seconds = 0.0;
         double global_solve_seconds = 0.0;
-        std::unique_ptr<gpg::PreparedSystem> active_system;
-        gpg::Vector active_source_field;
-        gpg::Vector active_receiver_field;
-        std::size_t active_shot = 0;
-        std::size_t active_frequency = 0;
+        struct FrequencyState {
+            gpg::Sparse source_matrix;
+            gpg::Sparse receiver_matrix;
+            gpg::Vector source_field;
+            gpg::Vector receiver_field;
+            std::size_t shot = 0;
+        };
+        std::vector<FrequencyState> frequency_states(axis.frequencies.size());
+        std::mutex metrics_mutex;
 
         auto begin_frequency = [&](std::size_t ifrequency) {
-            if (!global_started_set) {
-                global_started = fki::Clock::now();
-                global_started_set = true;
+            {
+                std::lock_guard<std::mutex> lock(metrics_mutex);
+                if (!global_started_set) {
+                    global_started = fki::Clock::now();
+                    global_started_set = true;
+                }
             }
             if (ifrequency >= axis.frequencies.size())
                 throw std::out_of_range("frequency index is out of range");
-            active_frequency = ifrequency;
-            active_system.reset();
+            FrequencyState& active = frequency_states[ifrequency];
             if (gmres_enable != 0) {
                 const auto factor_started = fki::Clock::now();
-                active_system = std::make_unique<gpg::PreparedSystem>(
-                    gpg::prepare_system(
-                        global_smoothed_velocity, model.nz, model.nx,
-                        model.dz, model.dx, axis.frequencies[ifrequency],
-                        prepared_parameters));
+                active.source_matrix = gpg::build_helmholtz(
+                    padded_velocity, padded_nz, padded_nx, model.dz, model.dx,
+                    axis.frequencies[ifrequency]);
+                active.receiver_matrix = gpg::build_helmholtz(
+                    padded_velocity, padded_nz, padded_nx, model.dz, model.dx,
+                    axis.frequencies[ifrequency], true);
                 if (ifrequency == 0) {
-                    std::cout
-                        << "GMRES physical grid   : "
-                        << active_system->physical_nz << 'x'
-                        << active_system->physical_nx << '\n'
-                        << "GMRES padded grid     : "
-                        << active_system->nz << 'x' << active_system->nx
-                        << " (external absorbing rows="
-                        << active_system->padding << ")\n";
+                    std::cout << "GMRES padded grid     : " << padded_nz << 'x'
+                              << padded_nx << " (PML=" << gpg::kPml << ")\n";
                 }
-                global_factor_seconds += std::chrono::duration<double>(
+                const double elapsed = std::chrono::duration<double>(
                     fki::Clock::now() - factor_started).count();
+                std::lock_guard<std::mutex> lock(metrics_mutex);
+                global_factor_seconds += elapsed;
             }
         };
 
         auto calculate_source_wavefield = [&](std::size_t ishot,
                                                std::size_t ifrequency) {
-            if (ishot >= states.size() || ifrequency != active_frequency)
+            if (ishot >= states.size() || ifrequency >= frequency_states.size())
                 throw std::out_of_range("shot/frequency stage is out of order");
-            active_shot = ishot;
+            FrequencyState& active = frequency_states[ifrequency];
+            active.shot = ishot;
             const int source_ix = nearest_global_source_ix(
                 model, states[ishot].shot_x);
-            active_source_field = build_global_source_aexp(
+            active.source_field = build_global_source_aexp(
                 model, source_traveltimes[ishot], axis.frequencies[ifrequency],
-                source_spectrum[ifrequency], source_ix,
-                global_source_regularization);
-            active_receiver_field = receiver_store_backend.load(
+                source_spectrum[ifrequency], source_ix, global_source_iz);
+            active.receiver_field = receiver_store_backend.load(
                 ishot, ifrequency, model);
             if (write_per_shot_images) {
                 const float weight = axis.imaging_weights[ifrequency];
                 for (std::size_t grid = 0; grid < grid_size; ++grid) {
-                    const gpg::Complex us = active_source_field[
+                    const gpg::Complex us = active.source_field[
                         static_cast<Eigen::Index>(grid)];
-                    const gpg::Complex ur = active_receiver_field[
+                    const gpg::Complex ur = active.receiver_field[
                         static_cast<Eigen::Index>(grid)];
-                    per_shot_before[ishot][grid] +=
-                        weight * static_cast<float>((us * ur).real());
+                    const float value = weight * static_cast<float>(
+                        (us * std::conj(ur)).real());
+#pragma omp atomic update
+                    per_shot_before[ishot][grid] += value;
                 }
-            }
-            if (active_system) {
-                active_source_field = gpg::embed_physical_field(
-                    *active_system, active_source_field);
-                active_receiver_field = gpg::embed_physical_field(
-                    *active_system, active_receiver_field);
             }
         };
 
         auto iteratively_correct = [&](std::size_t ishot,
                                        std::size_t ifrequency) {
-            if (ishot != active_shot || ifrequency != active_frequency)
+            FrequencyState& active = frequency_states[ifrequency];
+            if (ishot != active.shot)
                 throw std::logic_error("wavefield correction called out of order");
             if (gmres_enable == 0) return;
-            const int source_ix = nearest_global_source_ix(
-                model, states[ishot].shot_x);
-            const gpg::Vector source_rhs = gpg::make_source_rhs(
-                *active_system, source_ix,
-                gpg::Complex(source_spectrum[ifrequency].real(),
-                             source_spectrum[ifrequency].imag()), model.dx, model.dz);
-            const gpg::Vector receiver_rhs = gpg::receiver_equivalent_source(
-                *active_system, active_receiver_field,
-                global_correction.receiver_mask_rows);
-            const gpg::Vector receiver_guess = gpg::apply_receiver_mask(
-                *active_system, active_receiver_field,
-                global_correction.receiver_mask_rows);
-            gpg::Metric source_metric;
-            gpg::Metric receiver_metric;
+            gpg::Result source_metric;
+            gpg::Result receiver_metric;
+            const gpg::Vector source_before = active.source_field;
+            const gpg::Vector receiver_before = active.receiver_field;
             const auto solve_started = fki::Clock::now();
-            active_source_field = gpg::solve(
-                *active_system, source_rhs, active_source_field, &source_metric);
-            active_receiver_field = gpg::solve(
-                *active_system, receiver_rhs, receiver_guess, &receiver_metric);
+            active.source_field = reference_correct_field(
+                active.source_matrix, active.source_field, model.nz, model.nx,
+                global_correction_iz, gmres_restart, gmres_outer, &source_metric);
+            active.receiver_field = reference_correct_field(
+                active.receiver_matrix, active.receiver_field, model.nz, model.nx,
+                global_correction_iz, gmres_restart, gmres_outer, &receiver_metric);
+            std::lock_guard<std::mutex> lock(metrics_mutex);
             global_solve_seconds += std::chrono::duration<double>(
                 fki::Clock::now() - solve_started).count();
             correction_stream
                 << shots[ishot] << ",-1," << axis.frequencies[ifrequency]
-                << ",source,1," << source_metric.gmres_steps << ','
+                << ",source,1," << source_metric.steps << ','
                 << source_metric.residual_before << ','
                 << source_metric.residual_after << ','
-                << source_metric.correction_norm << ",1\n"
+                << (active.source_field - source_before).norm() << ",1\n"
                 << shots[ishot] << ",-1," << axis.frequencies[ifrequency]
-                << ",receiver,1," << receiver_metric.gmres_steps << ','
+                << ",receiver,1," << receiver_metric.steps << ','
                 << receiver_metric.residual_before << ','
                 << receiver_metric.residual_after << ','
-                << receiver_metric.correction_norm << ",1\n";
+                << (active.receiver_field - receiver_before).norm() << ",1\n";
         };
 
         auto cross_correlate = [&](std::size_t ishot,
                                    std::size_t ifrequency) {
-            if (ishot != active_shot || ifrequency != active_frequency)
+            FrequencyState& active = frequency_states[ifrequency];
+            if (ishot != active.shot)
                 throw std::logic_error("cross correlation called out of order");
             const float weight = axis.imaging_weights[ifrequency];
-            const gpg::Vector physical_source = active_system
-                ? gpg::crop_physical_field(*active_system, active_source_field)
-                : active_source_field;
-            const gpg::Vector physical_receiver = active_system
-                ? gpg::crop_physical_field(*active_system, active_receiver_field)
-                : active_receiver_field;
+            const gpg::Vector& physical_source = active.source_field;
+            const gpg::Vector& physical_receiver = active.receiver_field;
             for (std::size_t grid = 0; grid < grid_size; ++grid) {
                 const gpg::Complex us = physical_source[
                     static_cast<Eigen::Index>(grid)];
                 const gpg::Complex ur = physical_receiver[
                     static_cast<Eigen::Index>(grid)];
-                const float after_value = weight * static_cast<float>((us * ur).real());
+                const float after_value = weight * static_cast<float>(
+                    (us * std::conj(ur)).real());
+#pragma omp atomic update
                 image[grid] += after_value;
-                illumination[grid] += weight * static_cast<float>(std::norm(us));
+                const float illumination_value = weight * static_cast<float>(std::norm(us));
+#pragma omp atomic update
+                illumination[grid] += illumination_value;
                 if (write_per_shot_images)
+#pragma omp atomic update
                     per_shot_after[ishot][grid] += after_value;
             }
         };
@@ -2065,11 +2109,12 @@ int with_global_bf_imaging_workflow(
                 (ifrequency == 0 || ifrequency + 1 == axis.frequencies.size() ||
                  (ifrequency + 1) % static_cast<std::size_t>(
                      std::max(bpack_progress_every, 1)) == 0)) {
+                std::lock_guard<std::mutex> lock(metrics_mutex);
                 std::cout << "  [global correction] frequency="
                           << (ifrequency + 1) << '/' << axis.frequencies.size()
                           << " f=" << axis.frequencies[ifrequency]
                           << " Hz, iterations="
-                          << (gmres_enable != 0 ? global_correction.iterations : 0)
+                          << (gmres_enable != 0 ? gmres_outer : 0)
                           << '\n';
             }
         };
@@ -2077,6 +2122,9 @@ int with_global_bf_imaging_workflow(
         auto implementation = std::make_unique<GlobalBfImagingWorkflow::Impl>();
         implementation->shots = states.size();
         implementation->frequencies = axis.frequencies.size();
+        implementation->frequency_threads = gmres_frequency_threads > 0
+            ? gmres_frequency_threads
+            : std::min(options.threads > 0 ? options.threads : 4, 4);
         implementation->calculate_receivers = calculate_receiver_wavefields;
         implementation->begin_frequency = begin_frequency;
         implementation->calculate_source = calculate_source_wavefield;
@@ -2090,9 +2138,7 @@ int with_global_bf_imaging_workflow(
         std::cout
             << "Global correction     : "
             << (gmres_enable != 0 ? "enabled" : "disabled") << '\n'
-            << "Global smooth sigma  : " << global_correction.smooth_sigma
-            << " grid samples\n"
-            << "Shifted-Lap beta     : " << global_correction.shift_beta << '\n'
+            << "GMRES preconditioner : none\n"
             << "Global factor time   : " << global_factor_seconds << " s\n"
             << "Global solve time    : " << global_solve_seconds << " s\n"
             << "Global stage wall    : "

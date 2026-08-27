@@ -746,8 +746,8 @@ frequency_kirchhoff_imaging_bf_gmres
 功能
 ----
 仅保留生产全局矫正流程：由 eFMM 走时构造 A*exp(-i*omega*T) 震源初场，
-使用递归矩形 ButterflyPACK 计算检波波场，在完整模型上分别进行移位
-Laplacian + SuperLU ILUTP 预条件 GMRES 全局矫正，最后互相关成像。
+使用递归矩形 ButterflyPACK 计算检波波场，并用参考实现的高阶 Helmholtz
+算子和无预条件重启 GMRES 做全局矫正，最后互相关成像。
 
 用法
 ----
@@ -784,16 +784,12 @@ ButterflyPACK 检波波场参数
 ------------
   gmres_enable=0|1              默认 1
   global_gmres_iterations=10
-  gmres_restart=30 gmres_tolerance=1e-8
-  gmres_nabs=25 gmres_damp_max=2
-      吸收层在原始模型四周向外扩展，迭代完成后裁回原始模型大小。
-  global_smooth_sigma=1 global_shift_beta=0.30
-  global_ilut_drop_tolerance=0.03
-  global_ilut_fill_factor=12
-  global_ilut_pivot_threshold=0.10
-  global_receiver_mask_rows=2
+  gmres_restart=30              每次重启的 Krylov 维数
+  gmres_frequency_threads=0     频率级 OpenMP 并行；0=自动（最多 4）
+      GMRES 与参考程序一致，不使用任何预条件器。
   global_storage_max_mb=8192
-  global_source_regularization=0.10
+  global_source_z=0 global_source_correction_z0=0.105
+      仅在 z0 以下做缺陷矫正；浅于 z0 的原始运动学保持不变。
   correction_csv=FILE           默认 global_gmres_metrics.csv
 )KHELP";
     }
