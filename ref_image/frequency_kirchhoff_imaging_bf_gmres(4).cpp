@@ -629,9 +629,40 @@ int main(int argc, char** argv)
             "gmres_restart", gpg::kDefaultRestart);
         const int gmres_outer = huygens_cli::optional_int(
             "gmres_outer", gpg::kDefaultOuter);
+        const float bpack_tolerance = huygens_cli::optional_float(
+            "bpack_tol", 1.0e-4f);
+        const int bpack_leaf_size = huygens_cli::optional_int(
+            "bpack_leaf", 64);
+        const int bpack_verbosity = huygens_cli::optional_int(
+            "bpack_verbosity", -1);
+        const int bpack_lr_level = huygens_cli::optional_int(
+            "bpack_lrlevel", 100);
+        const float bpack_sample_parameter = huygens_cli::optional_float(
+            "bpack_sample_para", 1.5f);
+        const int bpack_forward_n15 = huygens_cli::optional_int(
+            "bpack_forward_n15", 0);
+        const int bpack_knn = huygens_cli::optional_int("bpack_knn", 0);
+        const int bpack_pattern_compression = huygens_cli::optional_int(
+            "bpack_pat_comp", 1);
+        const int bpack_less_adapt = huygens_cli::optional_int(
+            "bpack_less_adapt", 1);
+        const float bpack_rank_detection_factor = huygens_cli::optional_float(
+            "bpack_rdetect_factor", 0.3f);
+        const int bpack_reuse_tree = huygens_cli::optional_int(
+            "bpack_reuse_tree", 1);
+        const int bpack_progress = huygens_cli::optional_int(
+            "bpack_progress", 1);
+        const int bpack_progress_every = huygens_cli::optional_int(
+            "bpack_progress_every", 1);
         if (gmres_restart < 1 || gmres_outer < 1) {
             throw std::invalid_argument(
                 "gmres_restart and gmres_outer must both be positive");
+        }
+        if (bpack_tolerance <= 0.0f || bpack_leaf_size < 1 ||
+            bpack_lr_level < 0 || bpack_sample_parameter <= 0.0f ||
+            bpack_rank_detection_factor <= 0.0f ||
+            bpack_progress_every < 1) {
+            throw std::invalid_argument("invalid Butterfly parameter");
         }
         const std::string field_output =
             huygens_cli::optional_string("source_wavefield_output_dir", "");
@@ -680,20 +711,20 @@ int main(int argc, char** argv)
         std::vector<float> illumination_after_correction(grid_size, 0.0f);
         std::vector<float> timing(4 * blocks.blocks.size(), 0.0f);
 
-        const se::butterfly::Options butterfly_options = [] {
+        const se::butterfly::Options butterfly_options = [&] {
             se::butterfly::Options options;
-            options.tolerance = 1.0e-4f;
-            options.leaf_size = 64;
-            options.verbosity = -1;
+            options.tolerance = bpack_tolerance;
+            options.leaf_size = bpack_leaf_size;
+            options.verbosity = bpack_verbosity;
             options.coordinate_dimension = 2;
-            options.lr_level = 100;
-            options.sample_parameter = 1.5f;
-            options.forward_n15_flag = 0;
-            options.nearest_neighbors = 0;
-            options.compression_pattern = 1;
-            options.less_adapt = 1;
-            options.rank_detection_factor = 0.3f;
-            options.reuse_geometry = 1;
+            options.lr_level = bpack_lr_level;
+            options.sample_parameter = bpack_sample_parameter;
+            options.forward_n15_flag = bpack_forward_n15;
+            options.nearest_neighbors = bpack_knn;
+            options.compression_pattern = bpack_pattern_compression;
+            options.less_adapt = bpack_less_adapt;
+            options.rank_detection_factor = bpack_rank_detection_factor;
+            options.reuse_geometry = bpack_reuse_tree;
             return options;
         }();
 
@@ -767,6 +798,23 @@ int main(int argc, char** argv)
                 const float frequency = axis.frequencies[ifrequency];
                 std::vector<std::vector<fki::Complex>> propagated;
 
+                const bool print_progress = bpack_progress != 0 &&
+                    (ifrequency % static_cast<std::size_t>(bpack_progress_every) == 0 ||
+                     ifrequency + 1 == frequency_count);
+                if (print_progress) {
+                    std::cout << "Receiver Kirchhoff: block=" << block.id
+                              << ", frequency=" << ifrequency + 1 << '/'
+                              << frequency_count << ", f=" << frequency << " Hz, ";
+                    if (first_block) {
+                        std::cout << "phase shift (no Butterfly build)\n";
+                    } else {
+                        std::cout << "building Butterfly matrix once\n";
+                    }
+                }
+
+                double frequency_build_seconds = 0.0;
+                double frequency_apply_seconds = 0.0;
+
                 if (first_block) {
                     propagated.reserve(states.size());
                     for (const auto& state : states) {
@@ -805,14 +853,16 @@ int main(int argc, char** argv)
                             return kernel.entry(row, source);
                         },
                         butterfly_options);
-                    build_seconds += std::chrono::duration<double>(
+                    frequency_build_seconds = std::chrono::duration<double>(
                         fki::Clock::now() - build_start).count();
+                    build_seconds += frequency_build_seconds;
 
                     const auto apply_start = fki::Clock::now();
                     const std::vector<std::vector<fki::Complex>> output =
                         butterfly.apply_many(input);
-                    apply_seconds += std::chrono::duration<double>(
+                    frequency_apply_seconds = std::chrono::duration<double>(
                         fki::Clock::now() - apply_start).count();
+                    apply_seconds += frequency_apply_seconds;
 
                     propagated.reserve(output.size());
                     for (const auto& field : output) {
@@ -820,6 +870,18 @@ int main(int argc, char** argv)
                             depth_major(field, model.nx,
                                         static_cast<int>(geometry.target_iz.size())));
                     }
+                }
+
+                if (print_progress) {
+                    std::cout << "Receiver Kirchhoff: block=" << block.id
+                              << ", frequency=" << ifrequency + 1 << '/'
+                              << frequency_count << ", f=" << frequency << " Hz done";
+                    if (!first_block) {
+                        std::cout << ", Butterfly build=" << frequency_build_seconds
+                                  << " s, apply=" << frequency_apply_seconds
+                                  << " s";
+                    }
+                    std::cout << '\n';
                 }
 
                 for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
@@ -885,6 +947,10 @@ int main(int argc, char** argv)
                 true);
 
             for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
+                // The point-ray kernel carries the positive outgoing phase.
+                // With the forward-FFT Ricker spectrum S(w), conj(S(w))
+                // therefore represents U_s^*: the conjugated source field
+                // needed by the conventional frequency-domain condition.
                 const gpg::Complex source = std::conj(gpg::Complex(
                     source_spectrum[ifrequency].real(),
                     source_spectrum[ifrequency].imag()));
@@ -944,9 +1010,14 @@ int main(int argc, char** argv)
                         const gpg::Complex source_before = ray[local];
                         const gpg::Complex receiver_before =
                             receiver_kirchhoff[local];
+                        // receiver_kirchhoff starts from conj(D), is continued
+                        // with the adjoint (negative-phase) receiver operator,
+                        // and is therefore U_r^*.  The source ray is U_s^*.
+                        // Conventional imaging is Re{U_s^* U_r}; conjugate
+                        // the stored receiver field exactly once here.
                         image_before_correction_field[grid] +=
                             weight * static_cast<float>(
-                                (source_before * receiver_before).real());
+                                (source_before * std::conj(receiver_before)).real());
                         illumination_before_correction_field[grid] +=
                             weight * static_cast<float>(std::norm(source_before));
 
@@ -955,7 +1026,7 @@ int main(int argc, char** argv)
                         const gpg::Complex receiver_after =
                             receiver_corrected.field[local];
                         image_after_correction[grid] += weight * static_cast<float>(
-                            (source_after * receiver_after).real());
+                            (source_after * std::conj(receiver_after)).real());
                         illumination_after_correction[grid] +=
                             weight * static_cast<float>(std::norm(source_after));
                     }
@@ -963,12 +1034,8 @@ int main(int argc, char** argv)
             }
         }
 
-        fki::finish_image(
-            options, model, image_before_correction_field,
-            illumination_before_correction_field);
-        fki::finish_image(
-            options, model, image_after_correction,
-            illumination_after_correction);
+        // Keep the conventional, unnormalized frequency-domain
+        // cross-correlation.  Illumination is written only for diagnosis.
         if (!image_before_correction.empty()) {
             se::huygens::write_image_rsf(
                 image_before_correction, model, image_before_correction_field,

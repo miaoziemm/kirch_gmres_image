@@ -87,7 +87,9 @@ inline Sparse build_helmholtz(const std::vector<float>& velocity,
             add_second_derivative(terms, row, ix, nx, 1, dx);
             const double pml = k2 * damping(iz, ix, nz, nx);
             // The receiver spectrum is conjugated before continuation, so
-            // its global correction uses the adjoint Helmholtz operator.
+            // its global correction uses the adjoint Helmholtz operator.  The
+            // imaging condition subsequently correlates source with the
+            // conjugate of this corrected receiver field.
             terms.emplace_back(
                 row, row, Complex(k2, adjoint_operator ? -pml : pml));
         }
