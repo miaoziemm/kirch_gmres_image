@@ -71,8 +71,10 @@ FMAX="${FMAX:-40}"
 FREQUENCY_STRIDE="${FREQUENCY_STRIDE:-1}"
 
 CORRECTION_Z0=0.105
+SOURCE_Z="${SOURCE_Z:-${SZ}}"
 GMRES_OUTER=30
 GMRES_RESTART=30
+GMRES_FREQUENCY_THREADS="${GMRES_FREQUENCY_THREADS:-4}"
 
 # ============================================================================
 # 6. Derived output names
@@ -323,6 +325,9 @@ OMP_NUM_THREADS="${THREADS}" \
     bpack_reuse_tree=1 bpack_depth_chunk=20 bpack_progress=1 \
     gmres_enable=1 global_gmres_iterations="${GMRES_OUTER}" \
     gmres_restart="${GMRES_RESTART}" \
+    gmres_frequency_threads="${GMRES_FREQUENCY_THREADS}" \
+    global_source_z="${SOURCE_Z}" \
+    global_source_correction_z0="${CORRECTION_Z0}" \
     receiver_store=disk receiver_store_dir="${RECEIVER_STORE_DIR}" \
     per_shot_image_dir="${FREQUENCY_FIELD_DIR}" \
     per_shot_image_max_mb=8192 \
@@ -363,8 +368,9 @@ echo "Receivers nr / r0 / dr:        ${NR} / ${R0} / ${DR}"
 echo "Blocks first/block/overlap:    ${FIRST_BLOCK_ROWS}/${BLOCK_ROWS}/${OVERLAP_ROWS}"
 echo "Smoothing sigma:               ${SMOOTH_SIGMA}"
 echo "Frequency fmin/fmax/stride:    ${FMIN}/${FMAX}/${FREQUENCY_STRIDE}"
-echo "NFFT:                          ${NFFT}"
 echo "GMRES outer/restart:           ${GMRES_OUTER}/${GMRES_RESTART}"
+echo "GMRES frequency threads:       ${GMRES_FREQUENCY_THREADS}"
+echo "Global source z:               ${SOURCE_Z}"
 echo "Correction z0:                 ${CORRECTION_Z0}"
 echo
 echo "Forward record:                ${SHOT_DATA}"

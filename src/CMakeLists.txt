@@ -46,8 +46,7 @@ else()
         "Skipping f_image_rtm_kirch: ButterflyPACK float is unavailable")
 endif()
 
-if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float
-   AND TARGET Kirch::SuperLU)
+if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float)
     kirch_add_application(frequency_kirchhoff_imaging_bf_gmres
         frequency_kirchhoff_imaging_bf_gmres.cpp
         ${PROJECT_SOURCE_DIR}/SERECKIRCH/src/global_bf_imaging_workflow.cpp)
@@ -55,11 +54,11 @@ if(KIRCH_ENABLE_BUTTERFLYPACK AND TARGET ButterflyPACK::float
         f_image_rtm_kirch_multishot.cpp
         ${PROJECT_SOURCE_DIR}/SERECKIRCH/src/global_bf_imaging_workflow.cpp)
     target_link_libraries(frequency_kirchhoff_imaging_bf_gmres
-        PRIVATE Kirch::reckirch Kirch::eigen Kirch::SuperLU)
+        PRIVATE Kirch::reckirch Kirch::eigen)
     target_link_libraries(f_image_rtm_kirch_multishot
-        PRIVATE Kirch::reckirch Kirch::eigen Kirch::SuperLU)
+        PRIVATE Kirch::reckirch Kirch::eigen)
 
 else()
     message(STATUS
-        "Skipping frequency_kirchhoff_imaging_bf_gmres: ButterflyPACK float or SuperLU is unavailable")
+        "Skipping frequency_kirchhoff_imaging_bf_gmres: ButterflyPACK float is unavailable")
 endif()
