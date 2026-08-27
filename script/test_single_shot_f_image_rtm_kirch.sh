@@ -2,22 +2,11 @@
 set -euo pipefail
 
 # ============================================================================
-# Parameter-aligned test for f_image_rtm_kirch
-#
-# Physical/numerical parameters are aligned with:
-#   run_mar_single_shot_bf_gmres_compare_on_off_big(2).sh
-#
-# Keep the original test preprocessing:
-#   original-model forward record -> direct-wave mute -> imaging
-#
-# No Python utility is used in this script.
-#
-# The intended remaining difference is the imaging executable itself:
-#   reference: frequency_kirchhoff_imaging_bf_global_gmres
-#   this test: f_image_rtm_kirch
+# Parameter-aligned test for f_image_rtm_kirch.
+# Only parameter values are aligned; executable programs and workflow are unchanged.
 # ============================================================================
 
-REUSE="${REUSE:-0}"
+REUSE="${REUSE:-1}"
 
 # ============================================================================
 # 1. Paths
@@ -32,6 +21,7 @@ WORK_DIR="${ROOT_DIR}/single_shot_f_image_rtm_kirch_test"
 # 2. Runtime resources
 # ============================================================================
 THREADS=32
+MAX_TABLE_MB=8192
 
 # ============================================================================
 # 3. Forward-modeling parameters
@@ -52,8 +42,6 @@ R0=0.0
 DR=0.0105
 
 NBC=40
-L=30
-ALPHA=1
 LAPLACE_TYPE=0
 
 # ============================================================================
@@ -67,7 +55,7 @@ SOURCE_STRIDE=1
 TARGET_X_STRIDE=1
 TARGET_Z_STRIDE=1
 
-# Use the compiled C++ smoother. sigma=2 is isotropic in x/z.
+# Velocity smoothing parameter.
 SMOOTH_SIGMA=2
 
 # Keep the original direct-wave mute workflow.
@@ -82,14 +70,6 @@ FMIN="${FMIN:-10}"
 FMAX="${FMAX:-40}"
 FREQUENCY_STRIDE="${FREQUENCY_STRIDE:-1}"
 
-NFFT=8192
-
-APERTURE_TRACE=-1
-APERTURE_DISTANCE=4
-
-SOURCE_TIME=0.075
-SOURCE_AMPLITUDE=1
-
 CORRECTION_Z0=0.105
 GMRES_OUTER=30
 GMRES_RESTART=30
@@ -101,20 +81,20 @@ SHOT_DATA="${WORK_DIR}/single_shot.rsf"
 MUTED_SHOT_DATA="${WORK_DIR}/single_shot_muted.rsf"
 
 IMAGING_MODEL="${WORK_DIR}/vmar_smooth.rsf"
-BLOCK_FILE="${WORK_DIR}/blocks.txt"
+BLOCK_FILE="${WORK_DIR}/huygens_blocks.txt"
 
-TABLE_DIR="${WORK_DIR}/travel"
+TABLE_DIR="${WORK_DIR}/traveltime"
 TABLE_PREFIX="${TABLE_DIR}/travel"
-TRAVEL_TIMING="${WORK_DIR}/travel_timing.rsf"
+TRAVEL_TIMING="${WORK_DIR}/traveltime_timing.rsf"
 
-IMAGE="${WORK_DIR}/image.rsf"
-ILLUMINATION="${WORK_DIR}/illumination.rsf"
-TIMING="${WORK_DIR}/timing.rsf"
+IMAGE="${WORK_DIR}/single_shot_image.rsf"
+ILLUMINATION="${WORK_DIR}/single_shot_illumination.rsf"
+TIMING="${WORK_DIR}/single_shot_timing.rsf"
 
-IMAGE_NO_GMRES="${WORK_DIR}/image_before_correction.rsf"
-ILLUMINATION_NO_GMRES="${WORK_DIR}/illumination_before_correction.rsf"
+IMAGE_NO_GMRES="${WORK_DIR}/single_shot_image_no_gmres.rsf"
+ILLUMINATION_NO_GMRES="${WORK_DIR}/single_shot_illumination_no_gmres.rsf"
 
-FREQUENCY_FIELD_DIR="${WORK_DIR}/source_wavefields"
+FREQUENCY_FIELD_DIR="${WORK_DIR}/frequency_fields"
 
 # ============================================================================
 # 7. Helper functions
@@ -164,14 +144,14 @@ mkdir -p "${WORK_DIR}" "${TABLE_DIR}" "${FREQUENCY_FIELD_DIR}"
 cd "${ROOT_DIR}"
 
 # ============================================================================
-# 9. Check required compiled executables
+# 9. Check executables
 # ============================================================================
 for program in \
     sewave2d_forward \
     mute_direct_wave \
     smooth_velocity_model \
     huygens_block_info \
-    travel_time_solver_oneway \
+    travel_time_solver \
     f_image_rtm_kirch
 do
     if [[ ! -x "${BIN_DIR}/${program}" ]]; then
@@ -208,12 +188,7 @@ else
         r0="${R0}" \
         dr="${DR}" \
         nbc="${NBC}" \
-        L="${L}" \
-        alpha="${ALPHA}" \
-        type_compute_Laplace="${LAPLACE_TYPE}" \
-        flag_smooth=0 \
-        flag_homo=0
-
+        type_compute_Laplace="${LAPLACE_TYPE}"
     if ! rsf_exists "${SHOT_DATA}"; then
         echo "Forward modeling failed: ${SHOT_DATA} was not created." >&2
         exit 1
@@ -247,10 +222,10 @@ else
 fi
 
 # ============================================================================
-# Step 3: Gaussian smoothing with compiled C++ program
+# Step 3: Smooth imaging velocity model
 # ============================================================================
 echo
-echo "[3/6] Smoothing velocity model with smooth_velocity_model: sigma=${SMOOTH_SIGMA}"
+echo "[3/6] Smoothing the velocity model"
 
 if [[ "${REUSE}" == "1" ]] && rsf_exists "${IMAGING_MODEL}"; then
     print_reuse "${IMAGING_MODEL}"
@@ -307,17 +282,17 @@ else
     rm -f "${TABLE_DIR}"/travel*.rsf@
     rm -f "${TRAVEL_TIMING}" "${TRAVEL_TIMING}@"
 
-    "${BIN_DIR}/travel_time_solver_oneway" \
+    "${BIN_DIR}/travel_time_solver" \
         velocity="${IMAGING_MODEL}" \
         block_file="${BLOCK_FILE}" \
         output_prefix="${TABLE_PREFIX}" \
         timing="${TRAVEL_TIMING}" \
-        include_first_block=1 \
         include_propagation_overlap=1 \
         source_stride="${SOURCE_STRIDE}" \
         target_x_stride="${TARGET_X_STRIDE}" \
         target_z_stride="${TARGET_Z_STRIDE}" \
-        threads="${THREADS}"
+        threads="${THREADS}" \
+        max_table_mb="${MAX_TABLE_MB}"
 
     if ! traveltime_exists; then
         echo "Traveltime calculation failed: no travel*.rsf files found." >&2
@@ -351,12 +326,7 @@ OMP_NUM_THREADS="${THREADS}" \
     shot_begin=0 \
     shot_count=1 \
     shot_stride=1 \
-    aperture_trace="${APERTURE_TRACE}" \
-    aperture_distance="${APERTURE_DISTANCE}" \
     fdom="${FDOM}" \
-    source_time="${SOURCE_TIME}" \
-    source_amplitude="${SOURCE_AMPLITUDE}" \
-    nfft="${NFFT}" \
     fmin="${FMIN}" \
     fmax="${FMAX}" \
     frequency_stride="${FREQUENCY_STRIDE}" \
