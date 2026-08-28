@@ -76,6 +76,26 @@ GMRES_OUTER=30
 GMRES_RESTART=30
 GMRES_FREQUENCY_THREADS="${GMRES_FREQUENCY_THREADS:-4}"
 
+# ButterflyPACK receiver-wavefield compression parameters.  Keep every
+# algorithm control explicit here so a test run does not silently change when
+# library defaults are adjusted.  Each value may be overridden from the
+# environment for accuracy/performance experiments.
+BPACK_TOL="${BPACK_TOL:-1e-4}"
+BPACK_LEAF="${BPACK_LEAF:-64}"
+BPACK_DEPTH_CHUNK="${BPACK_DEPTH_CHUNK:-20}"
+BPACK_LRLEVEL="${BPACK_LRLEVEL:-100}"
+BPACK_SAMPLE_PARA="${BPACK_SAMPLE_PARA:-1.5}"
+BPACK_FORWARD_N15="${BPACK_FORWARD_N15:-0}"
+BPACK_KNN="${BPACK_KNN:-10}"
+BPACK_PAT_COMP="${BPACK_PAT_COMP:-1}"
+BPACK_LESS_ADAPT="${BPACK_LESS_ADAPT:-1}"
+BPACK_RDETECT_FACTOR="${BPACK_RDETECT_FACTOR:-0.3}"
+BPACK_REUSE_TREE="${BPACK_REUSE_TREE:-1}"
+BPACK_GEOMETRY_CACHE_MB="${BPACK_GEOMETRY_CACHE_MB:-1024}"
+BPACK_VERBOSITY="${BPACK_VERBOSITY:--1}"
+BPACK_PROGRESS="${BPACK_PROGRESS:-1}"
+BPACK_PROGRESS_EVERY="${BPACK_PROGRESS_EVERY:-1}"
+
 # ============================================================================
 # 6. Derived output names
 # ============================================================================
@@ -322,7 +342,17 @@ OMP_NUM_THREADS="${THREADS}" \
     frequency_stride="${FREQUENCY_STRIDE}" \
     source_stride="${SOURCE_STRIDE}" target_x_stride="${TARGET_X_STRIDE}" \
     target_z_stride="${TARGET_Z_STRIDE}" threads="${THREADS}" \
-    bpack_reuse_tree=1 bpack_depth_chunk=20 bpack_progress=1 \
+    bpack_tol="${BPACK_TOL}" bpack_leaf="${BPACK_LEAF}" \
+    bpack_depth_chunk="${BPACK_DEPTH_CHUNK}" \
+    bpack_lrlevel="${BPACK_LRLEVEL}" \
+    bpack_sample_para="${BPACK_SAMPLE_PARA}" \
+    bpack_forward_n15="${BPACK_FORWARD_N15}" bpack_knn="${BPACK_KNN}" \
+    bpack_pat_comp="${BPACK_PAT_COMP}" bpack_less_adapt="${BPACK_LESS_ADAPT}" \
+    bpack_rdetect_factor="${BPACK_RDETECT_FACTOR}" \
+    bpack_reuse_tree="${BPACK_REUSE_TREE}" \
+    bpack_geometry_cache_mb="${BPACK_GEOMETRY_CACHE_MB}" \
+    bpack_verbosity="${BPACK_VERBOSITY}" bpack_progress="${BPACK_PROGRESS}" \
+    bpack_progress_every="${BPACK_PROGRESS_EVERY}" \
     gmres_enable=1 global_gmres_iterations="${GMRES_OUTER}" \
     gmres_restart="${GMRES_RESTART}" \
     gmres_frequency_threads="${GMRES_FREQUENCY_THREADS}" \
