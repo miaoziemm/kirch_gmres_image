@@ -34,6 +34,8 @@ namespace {
 constexpr const char* kProgramName = "frequency_kirchhoff_imaging_bf_global_gmres";
 constexpr const char* kMethodDescription =
     "reference point-ray source + recursive ButterflyPACK receiver + unpreconditioned restarted GMRES";
+constexpr double kReferenceRayPhase =
+    -0.75 * 3.141592653589793238462643383279502884;
 
 using PackedComplex = std::vector<float>;
 
@@ -708,7 +710,10 @@ gpg::Vector build_global_source_aexp(
             const double effective_time = std::max(travel_time, minimum_time);
             const double amplitude = 1.0 /
                 std::sqrt(8.0 * gpg::kPi * omega * effective_time);
-            const double phase = omega * travel_time + 0.25 * gpg::kPi;
+            // Match f_image_rtm_kirch::point_ray exactly.  The old +pi/4
+            // phase differs from the reference -3pi/4 phase by pi, reversing
+            // the source field before it is supplied to GMRES.
+            const double phase = omega * travel_time + kReferenceRayPhase;
             field[static_cast<Eigen::Index>(grid)] =
                 spectrum * std::polar(amplitude, phase);
         }
