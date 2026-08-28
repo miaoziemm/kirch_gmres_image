@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -36,6 +37,61 @@ constexpr const char* kMethodDescription =
     "reference point-ray source + recursive ButterflyPACK receiver + unpreconditioned restarted GMRES";
 constexpr double kReferenceRayPhase =
     -0.75 * 3.141592653589793238462643383279502884;
+
+std::uint64_t read_integer_file(const char* path)
+{
+    std::ifstream stream(path);
+    std::uint64_t value = 0;
+    stream >> value;
+    return stream ? value : 0;
+}
+
+std::uint64_t available_memory_bytes()
+{
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    std::uint64_t value = 0;
+    std::string unit;
+    std::uint64_t available = 0;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "MemAvailable:") {
+            available = value * 1024;
+            break;
+        }
+    }
+
+    const std::uint64_t cgroup_limit =
+        read_integer_file("/sys/fs/cgroup/memory.max");
+    const std::uint64_t cgroup_used =
+        read_integer_file("/sys/fs/cgroup/memory.current");
+    if (cgroup_limit > cgroup_used && cgroup_limit < (1ULL << 62)) {
+        const std::uint64_t cgroup_available = cgroup_limit - cgroup_used;
+        available = available == 0
+            ? cgroup_available : std::min(available, cgroup_available);
+    }
+    return available;
+}
+
+int memory_bounded_frequency_count(int requested, std::size_t padded_grid,
+                                   int restart)
+{
+    // Includes two 17-point complex sparse operators, their construction
+    // triplets, the restarted-GMRES basis, work vectors, and image terms.
+    // The safety margin also leaves room for receiver tiles and the OS.
+    const std::uint64_t bytes_per_grid_point =
+        2 * 17 * (sizeof(std::complex<double>) + sizeof(int)) +
+        static_cast<std::uint64_t>(restart + 16) *
+            sizeof(std::complex<double>) + 128;
+    const std::uint64_t per_frequency = std::max<std::uint64_t>(
+        1, padded_grid * bytes_per_grid_point);
+    const std::uint64_t available = available_memory_bytes();
+    if (available == 0) return 1;
+    const std::uint64_t safe_budget = available / 2;
+    const std::uint64_t memory_workers = std::max<std::uint64_t>(
+        1, safe_budget / per_frequency);
+    return static_cast<int>(std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(requested), memory_workers));
+}
 
 using PackedComplex = std::vector<float>;
 
@@ -765,7 +821,12 @@ gpg::Vector reference_correct_field(const gpg::Sparse& matrix,
             corrected[gpg::index(iz, ix, nx)] =
                 result.field[gpg::index(iz + gpg::kPml,
                                         ix + gpg::kPml, pnx)];
-    if (metric != nullptr) *metric = std::move(result);
+    if (metric != nullptr) {
+        // Callers use only convergence scalars.  Do not retain a second copy
+        // of the padded solution until the receiver solve has completed.
+        result.field.resize(0);
+        *metric = std::move(result);
+    }
     return corrected;
 }
 
@@ -1113,6 +1174,14 @@ int with_global_bf_imaging_workflow(
             fki::make_frequency_axis(data, options);
         const std::vector<int> shots =
             fki::selected_shots(data, options);
+        const int requested_frequency_threads = gmres_frequency_threads > 0
+            ? gmres_frequency_threads
+            : std::min(options.threads > 0 ? options.threads : 4, 4);
+        const std::size_t padded_grid_size =
+            static_cast<std::size_t>(model.nz + 2 * gpg::kPml) *
+            (model.nx + 2 * gpg::kPml);
+        const int concurrent_frequencies = memory_bounded_frequency_count(
+            requested_frequency_threads, padded_grid_size, gmres_restart);
 
         fki::validate_boundary_state_memory(
             options, shots.size(),
@@ -1135,9 +1204,9 @@ int with_global_bf_imaging_workflow(
             << (gmres_enable != 0 ? "enabled" : "disabled") << '\n'
             << "Global iterations    : " << gmres_outer << '\n'
             << "Frequency threads    : "
-            << (gmres_frequency_threads > 0
-                    ? gmres_frequency_threads
-                    : std::min(options.threads > 0 ? options.threads : 4, 4)) << '\n'
+            << requested_frequency_threads << '\n'
+            << "Memory-safe workers  : " << concurrent_frequencies
+            << " (automatic)\n"
             << "GMRES restart        : " << gmres_restart << '\n'
             << "Source/correction z  : " << model.z(global_source_iz) << "/"
             << model.z(global_correction_iz) << '\n'
@@ -1987,12 +2056,33 @@ int with_global_bf_imaging_workflow(
             gpg::Sparse receiver_matrix;
             gpg::Vector source_field;
             gpg::Vector receiver_field;
+            std::vector<float> image_contributions;
+            std::vector<float> illumination_contributions;
             std::size_t shot = 0;
         };
         std::vector<FrequencyState> frequency_states(axis.frequencies.size());
         std::mutex metrics_mutex;
+        std::mutex accumulation_mutex;
+        std::condition_variable accumulation_ready;
+        std::mutex frequency_slot_mutex;
+        std::condition_variable frequency_slot_ready;
+        int active_frequencies = 0;
+        // GMRES work is frequency-parallel, but floating-point additions must
+        // still occur in the legacy frequency-major/shot-major order.  Keep
+        // each frequency's terms separate until its ordered commit rather
+        // than using nondeterministic OpenMP atomics.
+        std::vector<std::size_t> next_before_frequency(states.size(), 0);
+        std::vector<std::size_t> next_after_frequency(states.size(), 0);
+        std::size_t next_image_frequency = 0;
 
         auto begin_frequency = [&](std::size_t ifrequency) {
+            {
+                std::unique_lock<std::mutex> lock(frequency_slot_mutex);
+                frequency_slot_ready.wait(lock, [&] {
+                    return active_frequencies < concurrent_frequencies;
+                });
+                ++active_frequencies;
+            }
             {
                 std::lock_guard<std::mutex> lock(metrics_mutex);
                 if (!global_started_set) {
@@ -2003,6 +2093,9 @@ int with_global_bf_imaging_workflow(
             if (ifrequency >= axis.frequencies.size())
                 throw std::out_of_range("frequency index is out of range");
             FrequencyState& active = frequency_states[ifrequency];
+            active.image_contributions.assign(states.size() * grid_size, 0.0f);
+            active.illumination_contributions.assign(
+                states.size() * grid_size, 0.0f);
             if (gmres_enable != 0) {
                 const auto factor_started = fki::Clock::now();
                 active.source_matrix = gpg::build_helmholtz(
@@ -2037,16 +2130,24 @@ int with_global_bf_imaging_workflow(
                 ishot, ifrequency, model);
             if (write_per_shot_images) {
                 const float weight = axis.imaging_weights[ifrequency];
+                std::vector<float> contribution(grid_size);
                 for (std::size_t grid = 0; grid < grid_size; ++grid) {
                     const gpg::Complex us = active.source_field[
                         static_cast<Eigen::Index>(grid)];
                     const gpg::Complex ur = active.receiver_field[
                         static_cast<Eigen::Index>(grid)];
-                    const float value = weight * static_cast<float>(
+                    contribution[grid] = weight * static_cast<float>(
                         (us * std::conj(ur)).real());
-#pragma omp atomic update
-                    per_shot_before[ishot][grid] += value;
                 }
+                std::unique_lock<std::mutex> lock(accumulation_mutex);
+                accumulation_ready.wait(lock, [&] {
+                    return next_before_frequency[ishot] == ifrequency;
+                });
+                for (std::size_t grid = 0; grid < grid_size; ++grid)
+                    per_shot_before[ishot][grid] += contribution[grid];
+                ++next_before_frequency[ishot];
+                lock.unlock();
+                accumulation_ready.notify_all();
             }
         };
 
@@ -2058,15 +2159,25 @@ int with_global_bf_imaging_workflow(
             if (gmres_enable == 0) return;
             gpg::Result source_metric;
             gpg::Result receiver_metric;
-            const gpg::Vector source_before = active.source_field;
-            const gpg::Vector receiver_before = active.receiver_field;
             const auto solve_started = fki::Clock::now();
-            active.source_field = reference_correct_field(
-                active.source_matrix, active.source_field, model.nz, model.nx,
-                global_correction_iz, gmres_restart, gmres_outer, &source_metric);
-            active.receiver_field = reference_correct_field(
-                active.receiver_matrix, active.receiver_field, model.nz, model.nx,
-                global_correction_iz, gmres_restart, gmres_outer, &receiver_metric);
+            double source_change = 0.0;
+            {
+                const gpg::Vector before = active.source_field;
+                active.source_field = reference_correct_field(
+                    active.source_matrix, active.source_field, model.nz, model.nx,
+                    global_correction_iz, gmres_restart, gmres_outer,
+                    &source_metric);
+                source_change = (active.source_field - before).norm();
+            }
+            double receiver_change = 0.0;
+            {
+                const gpg::Vector before = active.receiver_field;
+                active.receiver_field = reference_correct_field(
+                    active.receiver_matrix, active.receiver_field,
+                    model.nz, model.nx, global_correction_iz, gmres_restart,
+                    gmres_outer, &receiver_metric);
+                receiver_change = (active.receiver_field - before).norm();
+            }
             std::lock_guard<std::mutex> lock(metrics_mutex);
             global_solve_seconds += std::chrono::duration<double>(
                 fki::Clock::now() - solve_started).count();
@@ -2075,12 +2186,12 @@ int with_global_bf_imaging_workflow(
                 << ",source,1," << source_metric.steps << ','
                 << source_metric.residual_before << ','
                 << source_metric.residual_after << ','
-                << (active.source_field - source_before).norm() << ",1\n"
+                << source_change << ",1\n"
                 << shots[ishot] << ",-1," << axis.frequencies[ifrequency]
                 << ",receiver,1," << receiver_metric.steps << ','
                 << receiver_metric.residual_before << ','
                 << receiver_metric.residual_after << ','
-                << (active.receiver_field - receiver_before).norm() << ",1\n";
+                << receiver_change << ",1\n";
         };
 
         auto cross_correlate = [&](std::size_t ishot,
@@ -2098,18 +2209,58 @@ int with_global_bf_imaging_workflow(
                     static_cast<Eigen::Index>(grid)];
                 const float after_value = weight * static_cast<float>(
                     (us * std::conj(ur)).real());
-#pragma omp atomic update
-                image[grid] += after_value;
+                const std::size_t contribution_index = ishot * grid_size + grid;
+                active.image_contributions[contribution_index] = after_value;
                 const float illumination_value = weight * static_cast<float>(std::norm(us));
-#pragma omp atomic update
-                illumination[grid] += illumination_value;
-                if (write_per_shot_images)
-#pragma omp atomic update
-                    per_shot_after[ishot][grid] += after_value;
+                active.illumination_contributions[contribution_index] =
+                    illumination_value;
+            }
+            if (write_per_shot_images) {
+                std::unique_lock<std::mutex> lock(accumulation_mutex);
+                accumulation_ready.wait(lock, [&] {
+                    return next_after_frequency[ishot] == ifrequency;
+                });
+                for (std::size_t grid = 0; grid < grid_size; ++grid) {
+                    const gpg::Complex us = physical_source[
+                        static_cast<Eigen::Index>(grid)];
+                    const gpg::Complex ur = physical_receiver[
+                        static_cast<Eigen::Index>(grid)];
+                    per_shot_after[ishot][grid] += weight * static_cast<float>(
+                        (us * std::conj(ur)).real());
+                }
+                ++next_after_frequency[ishot];
+                lock.unlock();
+                accumulation_ready.notify_all();
             }
         };
 
         auto end_frequency = [&](std::size_t ifrequency) {
+            FrequencyState& active = frequency_states[ifrequency];
+            {
+                std::unique_lock<std::mutex> lock(accumulation_mutex);
+                accumulation_ready.wait(lock, [&] {
+                    return next_image_frequency == ifrequency;
+                });
+                for (std::size_t ishot = 0; ishot < states.size(); ++ishot) {
+                    for (std::size_t grid = 0; grid < grid_size; ++grid) {
+                        const std::size_t index = ishot * grid_size + grid;
+                        image[grid] += active.image_contributions[index];
+                        illumination[grid] +=
+                            active.illumination_contributions[index];
+                    }
+                }
+                active.image_contributions.clear();
+                active.illumination_contributions.clear();
+                // Sparse Helmholtz operators dominate the persistent memory
+                // for a frequency.  Release their capacity before allowing
+                // the next frequency into the memory-bounded section.
+                active.source_matrix = gpg::Sparse{};
+                active.receiver_matrix = gpg::Sparse{};
+                active.source_field.resize(0);
+                active.receiver_field.resize(0);
+                ++next_image_frequency;
+            }
+            accumulation_ready.notify_all();
             if (bpack_progress != 0 &&
                 (ifrequency == 0 || ifrequency + 1 == axis.frequencies.size() ||
                  (ifrequency + 1) % static_cast<std::size_t>(
@@ -2122,6 +2273,11 @@ int with_global_bf_imaging_workflow(
                           << (gmres_enable != 0 ? gmres_outer : 0)
                           << '\n';
             }
+            {
+                std::lock_guard<std::mutex> lock(frequency_slot_mutex);
+                --active_frequencies;
+            }
+            frequency_slot_ready.notify_one();
         };
 
         auto implementation = std::make_unique<GlobalBfImagingWorkflow::Impl>();

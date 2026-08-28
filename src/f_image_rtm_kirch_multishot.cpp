@@ -8,19 +8,11 @@ int main(int argc, char** argv)
         argc, argv,
         [](kirch::imaging::GlobalBfImagingWorkflow& imaging) {
             imaging.calculate_receiver_wavefields();
-            // Preserve the reference program's frequency-major accumulation
-            // order.  Parallel frequency processing changes the order of the
-            // floating-point image reductions and prevents a one-shot run
-            // from being numerically identical to f_image_rtm_kirch.
+#pragma omp parallel for schedule(dynamic) \
+    num_threads(imaging.frequency_parallelism())
             for (std::size_t frequency = 0;
                  frequency < imaging.frequency_count(); ++frequency) {
-                imaging.begin_frequency(frequency);
-                for (std::size_t shot = 0; shot < imaging.shot_count(); ++shot) {
-                    imaging.calculate_source_wavefield(shot, frequency);
-                    imaging.iteratively_correct_wavefields(shot, frequency);
-                    imaging.cross_correlate_image(shot, frequency);
-                }
-                imaging.end_frequency(frequency);
+                imaging.process_frequency(frequency);
             }
             imaging.finish();
         });

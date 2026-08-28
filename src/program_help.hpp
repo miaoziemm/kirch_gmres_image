@@ -786,6 +786,7 @@ ButterflyPACK 检波波场参数
   global_gmres_iterations=10
   gmres_restart=30              每次重启的 Krylov 维数
   gmres_frequency_threads=0     频率级 OpenMP 并行；0=自动（最多 4）
+      程序根据可用内存自动限制同时驻留的频率数，无需额外内存参数。
       GMRES 与参考程序一致，不使用任何预条件器。
   global_storage_max_mb=8192
   global_source_z=0 global_source_correction_z0=0.105
