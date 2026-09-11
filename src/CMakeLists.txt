@@ -1,6 +1,4 @@
 # src/CMakeLists.txt
-#
-# Compile the applications currently used in src/.
 
 function(kirch_add_application target)
 
@@ -137,7 +135,7 @@ target_link_libraries(
 
 
 # ============================================================
-# ButterflyPACK Kirchhoff test
+# Native ButterflyPACK C API Kirchhoff test
 # ============================================================
 
 kirch_add_application(
@@ -150,4 +148,6 @@ target_link_libraries(
     PRIVATE
         Kirch::reckirch
         Kirch::sefs
+        ButterflyPACK::float
+        OpenMP::OpenMP_CXX
 )

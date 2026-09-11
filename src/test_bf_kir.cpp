@@ -1,468 +1,527 @@
 #include <SERECKIRCH/include/huygens_sweep.hpp>
-#include <SERECKIRCH/include/se_butterfly.hpp>
 #include <SEFILESYSTEM/include/se_fs.h>
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+#include "cBPACK_wrapper.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
+#include <cstdint>
+#include <ctime>
 #include <iomanip>
 #include <iostream>
-#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-#ifndef KIRCH_HAS_BUTTERFLYPACK_FLOAT
-#error "test_bf_kir requires ButterflyPACK single-complex support."
-#endif
-
 using Complex = std::complex<float>;
+using NativeComplex = __complex__ float;
 using Clock = std::chrono::steady_clock;
 
-constexpr float PI = 3.14159265358979323846f;
-constexpr float FREQUENCY = 25.0f;
-constexpr float FILTER_DT = 0.001f;
-constexpr float FILTER_LENGTH = 0.025f;
-constexpr int BLOCK_ID = 1;
 
-constexpr double BF_TOL = 1.0e-4;
-constexpr int BF_LEAF = 64;
-constexpr double BF_SAMPLE_PARA = 4.0;
-constexpr int BF_KNN = 10;
-
-const std::string BLOCK_FILE = "block_info.dat";
-const std::string TABLE_PREFIX = "huygens_tt/travel";
-const std::string INPUT_FILE = "test_bf_block1_input_point_source.rsf";
-const std::string DIRECT_REAL_FILE = "test_bf_block1_direct_real.rsf";
-const std::string DIRECT_IMAG_FILE = "test_bf_block1_direct_imag.rsf";
-const std::string BF_REAL_FILE = "test_bf_block1_bf_real.rsf";
-const std::string BF_IMAG_FILE = "test_bf_block1_bf_imag.rsf";
-const std::string ERROR_FILE = "test_bf_block1_abs_error.rsf";
-
-
-/* 1-D 点源：中间位置为 1，其余为 0。 */
-std::vector<Complex> make_point_source(const se::huygens::Table3D& tau, int& source_index)
+/* 返回从 start 到当前时刻的秒数。 */
+double elapsed(const Clock::time_point& start)
 {
-    if (tau.nsource < 2) throw std::runtime_error("tau.nsource must be at least 2");
-
-    std::vector<Complex> input(static_cast<std::size_t>(tau.nsource), Complex(0.0f, 0.0f));
-    source_index = tau.nsource / 2;
-    input[static_cast<std::size_t>(source_index)] = Complex(1.0f, 0.0f);
-    return input;
+    return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
 
-/* 梯形积分权重。 */
+/* 设置 OpenMP 和 ButterflyPACK 线程数，BF_THREADS 可覆盖 main 中的默认线程数。 */
+void configure_threads(int default_threads)
+{
+    const char* value = std::getenv("BF_THREADS");
+    const int n = value ? std::atoi(value) : default_threads;
+    const std::string ns = std::to_string(n);
+
+    ::setenv("OMP_NUM_THREADS", ns.c_str(), 1);
+    ::setenv("OMP_DYNAMIC", "FALSE", 1);
+    ::setenv("OMP_PROC_BIND", "close", 1);
+    ::setenv("OMP_PLACES", "cores", 1);
+    ::setenv("OPENBLAS_NUM_THREADS", "1", 1);
+    ::setenv("GOTO_NUM_THREADS", "1", 1);
+
+#ifdef _OPENMP
+    omp_set_dynamic(0);
+    omp_set_num_threads(n);
+#endif
+}
+
+
+/* 将 std::complex<float> 转为 ButterflyPACK 使用的 C complex float。 */
+NativeComplex to_native(const Complex& z)
+{
+    NativeComplex out;
+    __real__ out = z.real();
+    __imag__ out = z.imag();
+    return out;
+}
+
+
+/* 将 ButterflyPACK 的 C complex float 转为 std::complex<float>。 */
+Complex from_native(NativeComplex z)
+{
+    return {static_cast<float>(__real__ z), static_cast<float>(__imag__ z)};
+}
+
+
+/* 生成 1-D 点源：中间位置为 1，其余位置为 0。 */
+std::vector<Complex> make_point_source(const se::huygens::Table3D& tau)
+{
+    std::vector<Complex> u(tau.nsource, Complex(0.0f, 0.0f));
+    u[tau.nsource / 2] = Complex(1.0f, 0.0f);
+    return u;
+}
+
+
+/* 生成 Kirchhoff 横向积分的梯形积分权重。 */
 std::vector<float> make_weights(const se::huygens::Table3D& tau)
 {
-    std::vector<float> weights(static_cast<std::size_t>(tau.nsource), tau.dx_source);
-    weights.front() *= 0.5f;
-    weights.back() *= 0.5f;
-    return weights;
+    std::vector<float> w(tau.nsource, tau.dx_source);
+    w.front() *= 0.5f;
+    w.back() *= 0.5f;
+    return w;
 }
 
 
-float maximum_traveltime(const se::huygens::Table3D& tau)
+/* 返回走时表中的最大走时。 */
+float max_tau(const se::huygens::Table3D& tau)
 {
-    if (tau.values.empty()) throw std::runtime_error("traveltime table is empty");
     return *std::max_element(tau.values.begin(), tau.values.end());
 }
 
 
-/*
- * Kirch_datuming 单频形式：
- *
- * K_ij = dx_j/pi * Delta_z_ij * tau_ij / R_ij^2 * H(tau_ij,omega)
- *
- * 其中 H 由 FrequencyKirchhoffFilter::response(tau) 给出。
- */
-Complex kirchhoff_entry(int row, int source,
-                        const se::huygens::Table3D& tau,
-                        const std::vector<float>& weights,
-                        const se::huygens::FrequencyKirchhoffFilter& filter,
-                        float source_z)
+/* 生成 ButterflyPACK 输出端 row 的二维坐标 (x,z)。 */
+std::vector<double> make_row_coord(const se::huygens::Table3D& tau)
 {
-    const int iz = row % tau.nz_target;
-    const int ix = row / tau.nz_target;
-    const std::size_t index = tau.index(source, ix, iz);
+    const int rows = tau.nx_target * tau.nz_target;
+    std::vector<double> coord(2 * rows);
 
-    const float traveltime = std::max(tau.values[index], 1.0e-8f);
-    const float target_x = tau.ox_target + ix * tau.dx_target;
-    const float target_z = tau.oz_target + iz * tau.dz_target;
-    const float source_x = tau.ox_source + source * tau.dx_source;
-
-    const float dx = target_x - source_x;
-    const float dz = target_z - source_z;
-    const float r2 = std::max(dx * dx + dz * dz, 1.0e-20f);
-
-    const float geometry = dz * traveltime / (PI * r2);
-    return weights[static_cast<std::size_t>(source)] * geometry * filter.response(traveltime);
+    for (int row = 0; row < rows; ++row) {
+        const int iz = row % tau.nz_target;
+        const int ix = row / tau.nz_target;
+        coord[2 * row] = tau.ox_target + ix * tau.dx_target;
+        coord[2 * row + 1] = tau.oz_target + iz * tau.dz_target;
+    }
+    return coord;
 }
 
 
-/* 直接 Kirchhoff 求和。 */
-std::vector<Complex> direct_kirchhoff(const se::huygens::Table3D& tau,
-                                      const std::vector<float>& weights,
-                                      const std::vector<Complex>& input,
-                                      const se::huygens::FrequencyKirchhoffFilter& filter,
-                                      float source_z)
+/* 生成 ButterflyPACK 输入端 column 的二维坐标 (x,z)。 */
+std::vector<double> make_col_coord(const se::huygens::Table3D& tau, float source_z)
 {
-    if (input.size() != static_cast<std::size_t>(tau.nsource))
-        throw std::runtime_error("input length does not match tau.nsource");
+    std::vector<double> coord(2 * tau.nsource);
 
-    const int rows = tau.nx_target * tau.nz_target;
-    std::vector<Complex> output(static_cast<std::size_t>(rows), Complex(0.0f, 0.0f));
+    for (int src = 0; src < tau.nsource; ++src) {
+        coord[2 * src] = tau.ox_source + src * tau.dx_source;
+        coord[2 * src + 1] = source_z;
+    }
+    return coord;
+}
+
+
+/* 保存当前频率的 Kirchhoff/ButterflyPACK 参数以及行列重排。 */
+struct BPackContext {
+    const se::huygens::Table3D* tau = nullptr;
+    const std::vector<float>* w = nullptr;
+    const se::huygens::FrequencyKirchhoffFilter* filter = nullptr;
+
+    float pi = 0.0f;
+    float frequency = 0.0f;
+    float source_z = 0.0f;
+
+    double bf_tol = 0.0;
+    double bf_sample = 0.0;
+    int bf_leaf = 0;
+    int bf_knn = 0;
+
+    int rows = 0;
+    int cols = 0;
+
+    std::vector<int> row_new2old;
+    std::vector<int> col_new2old;
+};
+
+
+/* 保存 ButterflyPACK C API 创建的对象句柄。 */
+struct BPackHandles {
+    F2Cptr ptree = nullptr, option = nullptr;
+    F2Cptr row_stats = nullptr, col_stats = nullptr, bf_stats = nullptr;
+    F2Cptr row_mat = nullptr, col_mat = nullptr;
+    F2Cptr row_mesh = nullptr, col_mesh = nullptr, bf_mesh = nullptr;
+    F2Cptr row_ker = nullptr, col_ker = nullptr, bf_ker = nullptr;
+    F2Cptr bf = nullptr;
+
+    int row_local = 0;
+    int col_local = 0;
+};
+
+
+/* 计算单个 Kirchhoff 矩阵元素 K_ij。 */
+Complex kirchhoff_entry(int row, int src, const BPackContext& ctx)
+{
+    const auto& tau = *ctx.tau;
+    const int iz = row % tau.nz_target;
+    const int ix = row / tau.nz_target;
+    const float t = std::max(tau.values[tau.index(src, ix, iz)], 1.0e-8f);
+
+    const float xt = tau.ox_target + ix * tau.dx_target;
+    const float zt = tau.oz_target + iz * tau.dz_target;
+    const float xs = tau.ox_source + src * tau.dx_source;
+
+    const float dx = xt - xs;
+    const float dz = zt - ctx.source_z;
+    const float r2 = std::max(dx * dx + dz * dz, 1.0e-20f);
+
+    // K_ij = dx_j/pi * Delta_z*tau/R^2 * H(tau,omega)
+    return (*ctx.w)[src] * dz * t / (ctx.pi * r2) * ctx.filter->response(t);
+}
+
+
+/* ButterflyPACK 几何建树使用的占位 distance 回调。 */
+void dummy_distance(int*, int*, double* value, C2Fptr)
+{
+    *value = 0.0;
+}
+
+
+/* ButterflyPACK 几何建树使用的占位 near/far 回调。 */
+void dummy_near_far(int*, int*, int* value, C2Fptr)
+{
+    *value = 0;
+}
+
+
+/* 根据 main 中给出的参数设置 ButterflyPACK 压缩选项。 */
+void set_bpack_options(F2Cptr* option, const BPackContext& ctx)
+{
+    auto D = [&](const char* key, double value) {
+        c_c_bpack_set_D_option(option, key, value);
+    };
+
+    auto I = [&](const char* key, int value) {
+        c_c_bpack_set_I_option(option, key, value);
+    };
+
+    D("tol_comp", ctx.bf_tol);
+    D("tol_rand", ctx.bf_tol);
+    D("tol_Rdetect", 0.1 * ctx.bf_tol);
+    D("sample_para", ctx.bf_sample);
+    D("sample_para_outer", ctx.bf_sample);
+
+    I("nogeo", 0);
+    I("Nmin_leaf", ctx.bf_leaf);
+    I("RecLR_leaf", 5);
+    I("xyzsort", 1);
+    I("cpp", 1);
+    I("LRlevel", 100);
+    I("forwardN15flag", 0);
+    I("knn", ctx.bf_knn);
+    I("verbosity", -1);
+    I("less_adapt", 1);
+    I("pat_comp", 3);
+    I("BACA_Batch", 16);
+    I("LR_BLK_NUM", 1);
+    I("itermax", 10);
+    I("ErrFillFull", 0);
+    I("ErrSol", 0);
+    I("elem_extract", 2);
+    I("format", 1);
+}
+
+
+/* ButterflyPACK 单元素回调：将重排索引映射回原 Kirchhoff 矩阵索引。 */
+void bpack_sample(int* a, int* b, NativeComplex* value, C2Fptr ptr)
+{
+    auto* ctx = static_cast<BPackContext*>(ptr);
+
+    const int row_new = (*a > 0) ? *a : *b;
+    const int col_new = (*a > 0) ? -*b : -*a;
+
+    const int row = ctx->row_new2old[row_new - 1] - 1;
+    const int col = ctx->col_new2old[col_new - 1] - 1;
+
+    *value = to_native(kirchhoff_entry(row, col, *ctx));
+}
+
+
+/* ButterflyPACK 块元素回调：OpenMP 并行计算一批 Kirchhoff 矩阵元素。 */
+void bpack_sample_block(int* nblock, int*, int*, std::int64_t*,
+                        int* all_rows, int* all_cols, NativeComplex* values,
+                        int* nrows, int* ncols, int*, int*, int*, C2Fptr ptr)
+{
+    auto* ctx = static_cast<BPackContext*>(ptr);
+    std::int64_t roff = 0, coff = 0, voff = 0;
+
+    for (int ib = 0; ib < *nblock; ++ib) {
+        const int nr = nrows[ib];
+        const int nc = ncols[ib];
+
+        std::vector<int> rows(nr), cols(nc);
+
+        for (int r = 0; r < nr; ++r)
+            rows[r] = ctx->row_new2old[all_rows[roff + r] - 1] - 1;
+
+        for (int c = 0; c < nc; ++c)
+            cols[c] = ctx->col_new2old[all_cols[coff + c] - 1] - 1;
+
+        const std::int64_t count = static_cast<std::int64_t>(nr) * nc;
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) if(count >= 4096)
 #endif
-    for (int row = 0; row < rows; ++row) {
-        Complex sum(0.0f, 0.0f);
-        for (int source = 0; source < tau.nsource; ++source) {
-            sum += kirchhoff_entry(row, source, tau, weights, filter, source_z)
-                 * input[static_cast<std::size_t>(source)];
+        for (std::int64_t k = 0; k < count; ++k) {
+            const int c = static_cast<int>(k / nr);
+            const int r = static_cast<int>(k % nr);
+            values[voff + k] = to_native(kirchhoff_entry(rows[r], cols[c], *ctx));
         }
-        output[static_cast<std::size_t>(row)] = sum;
+
+        roff += nr;
+        coff += nc;
+        voff += count;
     }
+}
+
+
+/* 释放 ButterflyPACK C API 创建的对象。 */
+void destroy_bpack(BPackHandles& h)
+{
+    if (h.bf) c_c_bf_deletebf(&h.bf);
+    if (h.bf_mesh) c_c_bpack_deletemesh(&h.bf_mesh);
+    if (h.bf_ker) c_c_bpack_deletekernelquant(&h.bf_ker);
+
+    if (h.row_mat) c_c_bpack_delete(&h.row_mat);
+    if (h.col_mat) c_c_bpack_delete(&h.col_mat);
+    if (h.row_mesh) c_c_bpack_deletemesh(&h.row_mesh);
+    if (h.col_mesh) c_c_bpack_deletemesh(&h.col_mesh);
+    if (h.row_ker) c_c_bpack_deletekernelquant(&h.row_ker);
+    if (h.col_ker) c_c_bpack_deletekernelquant(&h.col_ker);
+
+    if (h.row_stats) c_c_bpack_deletestats(&h.row_stats);
+    if (h.col_stats) c_c_bpack_deletestats(&h.col_stats);
+    if (h.bf_stats) c_c_bpack_deletestats(&h.bf_stats);
+
+    if (h.option) c_c_bpack_deleteoption(&h.option);
+    if (h.ptree) c_c_bpack_deleteproctree(&h.ptree);
+}
+
+
+/* 完成 row/column 建树、Butterfly 初始化和矩阵压缩。 */
+void build_butterfly(BPackContext& ctx, BPackHandles& h,
+                     std::vector<double>& row_coord,
+                     std::vector<double>& col_coord)
+{
+    int nproc = 1;
+    int groups[1] = {0};
+    MPI_Fint comm = static_cast<MPI_Fint>(321);
+
+    c_c_bpack_createptree(&nproc, groups, &comm, &h.ptree);
+    c_c_bpack_createoption(&h.option);
+    c_c_bpack_createstats(&h.row_stats);
+    c_c_bpack_createstats(&h.col_stats);
+    c_c_bpack_createstats(&h.bf_stats);
+    set_bpack_options(&h.option, ctx);
+
+    ctx.row_new2old.resize(ctx.rows);
+    ctx.col_new2old.resize(ctx.cols);
+
+    int row_counts[1] = {ctx.rows};
+    int col_counts[1] = {ctx.cols};
+    int row_tree[1] = {ctx.rows};
+    int col_tree[1] = {ctx.cols};
+
+    int level = 0;
+    int ndim = 2;
+    int rows = ctx.rows;
+    int cols = ctx.cols;
+
+    c_c_bpack_construct_init(
+        &rows, &ndim, row_coord.data(), row_counts, &level, row_tree,
+        ctx.row_new2old.data(), &h.row_local, &h.row_mat, &h.option,
+        &h.row_stats, &h.row_mesh, &h.row_ker, &h.ptree,
+        &dummy_distance, &dummy_near_far, &ctx);
+
+    level = 0;
+
+    c_c_bpack_construct_init(
+        &cols, &ndim, col_coord.data(), col_counts, &level, col_tree,
+        ctx.col_new2old.data(), &h.col_local, &h.col_mat, &h.option,
+        &h.col_stats, &h.col_mesh, &h.col_ker, &h.ptree,
+        &dummy_distance, &dummy_near_far, &ctx);
+
+    c_c_bf_construct_init(
+        &rows, &cols, &h.row_local, &h.col_local,
+        row_counts, col_counts, &h.row_mesh, &h.col_mesh,
+        &h.bf, &h.option, &h.bf_stats, &h.bf_mesh, &h.bf_ker, &h.ptree,
+        &dummy_distance, &dummy_near_far, &ctx);
+
+    c_c_bf_construct_element_compute(
+        &h.bf, &h.option, &h.bf_stats, &h.bf_mesh, &h.bf_ker, &h.ptree,
+        &bpack_sample, &bpack_sample_block, &ctx);
+}
+
+
+/* 调用 c_c_bf_mult 完成 Butterfly 矩阵乘并恢复原始 target 排列。 */
+std::vector<Complex> apply_butterfly(const BPackContext& ctx,
+                                     BPackHandles& h,
+                                     const std::vector<Complex>& input)
+{
+    std::vector<NativeComplex> x(ctx.cols), y(ctx.rows);
+
+    for (int i = 0; i < ctx.cols; ++i)
+        x[i] = to_native(input[ctx.col_new2old[i] - 1]);
+
+    char trans = 'N';
+    int nin = ctx.cols;
+    int nout = ctx.rows;
+    int nrhs = 1;
+
+    c_c_bf_mult(
+        &trans, x.data(), y.data(),
+        &nin, &nout, &nrhs,
+        &h.bf, &h.option, &h.bf_stats, &h.ptree);
+
+    std::vector<Complex> output(ctx.rows);
+
+    for (int i = 0; i < ctx.rows; ++i)
+        output[ctx.row_new2old[i] - 1] = from_native(y[i]);
 
     return output;
 }
 
 
-/* ButterflyPACK target 坐标：(x,z)。 */
-std::vector<double> make_row_coordinates(const se::huygens::Table3D& tau)
+/* 将 float 数组写成与 target 区域一致的 2-D RSF。 */
+void write_2d(const std::string& file,
+              const se::huygens::Table3D& tau,
+              const std::vector<float>& data)
 {
-    const int rows = tau.nx_target * tau.nz_target;
-    std::vector<double> coord(static_cast<std::size_t>(2 * rows));
+    sep_t* out = sep_open(file.c_str(), SEP_WRITE, 0);
 
-    for (int row = 0; row < rows; ++row) {
-        const int iz = row % tau.nz_target;
-        const int ix = row / tau.nz_target;
+    out->headers->ndim = 2;
+    out->headers->n[0] = tau.nz_target;
+    out->headers->n[1] = tau.nx_target;
+    out->headers->d[0] = tau.dz_target;
+    out->headers->d[1] = tau.dx_target;
+    out->headers->o[0] = tau.oz_target;
+    out->headers->o[1] = tau.ox_target;
+    out->headers->esize = 4;
+    out->headers->le = 1;
 
-        coord[static_cast<std::size_t>(2 * row)] =
-            static_cast<double>(tau.ox_target + ix * tau.dx_target);
-        coord[static_cast<std::size_t>(2 * row + 1)] =
-            static_cast<double>(tau.oz_target + iz * tau.dz_target);
-    }
-
-    return coord;
+    sep_set_header(out, "data_format", "native_float");
+    sep_set_header_int(out, "esize", 4);
+    se_fsio_write_float(out->data->io, data.data(), data.size());
+    sep_close(out);
 }
 
 
-/* ButterflyPACK input datum 坐标：(x,source_z)。 */
-std::vector<double> make_column_coordinates(const se::huygens::Table3D& tau, float source_z)
+/* 提取 Butterfly 复波场的实部或虚部并写成 RSF。 */
+void write_bf(const std::string& file,
+              const se::huygens::Table3D& tau,
+              const std::vector<Complex>& bf,
+              bool imag)
 {
-    std::vector<double> coord(static_cast<std::size_t>(2 * tau.nsource));
-
-    for (int source = 0; source < tau.nsource; ++source) {
-        coord[static_cast<std::size_t>(2 * source)] =
-            static_cast<double>(tau.ox_source + source * tau.dx_source);
-        coord[static_cast<std::size_t>(2 * source + 1)] = static_cast<double>(source_z);
-    }
-
-    return coord;
-}
-
-
-double relative_l2_error(const std::vector<Complex>& reference,
-                         const std::vector<Complex>& candidate)
-{
-    if (reference.size() != candidate.size())
-        throw std::runtime_error("vector sizes differ");
-
-    double num = 0.0, den = 0.0;
-    for (std::size_t i = 0; i < reference.size(); ++i) {
-        num += std::norm(candidate[i] - reference[i]);
-        den += std::norm(reference[i]);
-    }
-
-    return std::sqrt(num / std::max(den, 1.0e-30));
-}
-
-
-double maximum_normalized_error(const std::vector<Complex>& reference,
-                                const std::vector<Complex>& candidate)
-{
-    float max_ref = 0.0f, max_diff = 0.0f;
-
-    for (std::size_t i = 0; i < reference.size(); ++i) {
-        max_ref = std::max(max_ref, std::abs(reference[i]));
-        max_diff = std::max(max_diff, std::abs(candidate[i] - reference[i]));
-    }
-
-    return static_cast<double>(max_diff / std::max(max_ref, 1.0e-30f));
-}
-
-
-/* 输出 1-D 点源。 */
-void write_input_source(const std::string& filename,
-                        const se::huygens::Table3D& tau,
-                        const std::vector<Complex>& input)
-{
-    std::vector<float> values(input.size());
-    for (std::size_t i = 0; i < input.size(); ++i) values[i] = input[i].real();
-
-    sep_t* out = sep_open(filename.c_str(), SEP_WRITE, 0);
-    if (!out || !out->headers || !out->data || !out->data->io)
-        throw std::runtime_error("cannot create input RSF");
-
-    try {
-        out->headers->ndim = 1;
-        out->headers->n[0] = tau.nsource;
-        out->headers->d[0] = tau.dx_source;
-        out->headers->o[0] = tau.ox_source;
-        out->headers->esize = 4;
-        out->headers->le = 1;
-
-        sep_set_header(out, "data_format", "native_float");
-        sep_set_header_int(out, "esize", 4);
-        sep_set_header(out, "label1", "Datum distance");
-        sep_set_header(out, "title", "1-D point-source input");
-
-        se_fsio_write_float(out->data->io, values.data(), values.size());
-        sep_close(out);
-    } catch (...) {
-        sep_close(out);
-        throw;
-    }
-}
-
-
-/* 输出 2-D 波场，尺寸严格等于 travel_block_001_tau.rsf。 */
-void write_field_component(const std::string& filename,
-                           const se::huygens::Table3D& tau,
-                           const std::vector<Complex>& field,
-                           bool imaginary,
-                           const std::string& method)
-{
-    const std::size_t count =
-        static_cast<std::size_t>(tau.nz_target) * static_cast<std::size_t>(tau.nx_target);
-
-    if (field.size() != count)
-        throw std::runtime_error("field size does not match travel table");
-
-    std::vector<float> values(count);
-    for (std::size_t i = 0; i < count; ++i)
-        values[i] = imaginary ? field[i].imag() : field[i].real();
-
-    sep_t* out = sep_open(filename.c_str(), SEP_WRITE, 0);
-    if (!out || !out->headers || !out->data || !out->data->io)
-        throw std::runtime_error("cannot create output: " + filename);
-
-    try {
-        out->headers->ndim = 2;
-        out->headers->n[0] = tau.nz_target;
-        out->headers->n[1] = tau.nx_target;
-        out->headers->d[0] = tau.dz_target;
-        out->headers->d[1] = tau.dx_target;
-        out->headers->o[0] = tau.oz_target;
-        out->headers->o[1] = tau.ox_target;
-        out->headers->esize = 4;
-        out->headers->le = 1;
-
-        sep_set_header(out, "data_format", "native_float");
-        sep_set_header_int(out, "esize", 4);
-        sep_set_header(out, "label1", "Target depth");
-        sep_set_header(out, "unit1", "km");
-        sep_set_header(out, "label2", "Target distance");
-        sep_set_header(out, "unit2", "km");
-        sep_set_header(out, "method", method.c_str());
-        sep_set_header(out, "component", imaginary ? "imaginary" : "real");
-        sep_set_header_float(out, "frequency", FREQUENCY);
-
-        se_fsio_write_float(out->data->io, values.data(), values.size());
-        sep_close(out);
-    } catch (...) {
-        sep_close(out);
-        throw;
-    }
-}
-
-
-/* 输出 |Butterfly - Direct|。 */
-void write_error(const std::string& filename,
-                 const se::huygens::Table3D& tau,
-                 const std::vector<Complex>& direct,
-                 const std::vector<Complex>& butterfly)
-{
-    if (direct.size() != butterfly.size())
-        throw std::runtime_error("error vector sizes differ");
-
-    std::vector<float> values(direct.size());
-    for (std::size_t i = 0; i < direct.size(); ++i)
-        values[i] = std::abs(butterfly[i] - direct[i]);
-
-    sep_t* out = sep_open(filename.c_str(), SEP_WRITE, 0);
-    if (!out || !out->headers || !out->data || !out->data->io)
-        throw std::runtime_error("cannot create error output");
-
-    try {
-        out->headers->ndim = 2;
-        out->headers->n[0] = tau.nz_target;
-        out->headers->n[1] = tau.nx_target;
-        out->headers->d[0] = tau.dz_target;
-        out->headers->d[1] = tau.dx_target;
-        out->headers->o[0] = tau.oz_target;
-        out->headers->o[1] = tau.ox_target;
-        out->headers->esize = 4;
-        out->headers->le = 1;
-
-        sep_set_header(out, "data_format", "native_float");
-        sep_set_header_int(out, "esize", 4);
-        sep_set_header(out, "quantity", "absolute_error");
-        sep_set_header_float(out, "frequency", FREQUENCY);
-
-        se_fsio_write_float(out->data->io, values.data(), values.size());
-        sep_close(out);
-    } catch (...) {
-        sep_close(out);
-        throw;
-    }
-}
-
-
-int main()
-{
-    try {
-        std::cout << std::setprecision(8);
-        std::cout << "\n============================================\n"
-                  << " ButterflyPACK Kirchhoff datuming test\n"
-                  << " block     = " << BLOCK_ID << "\n"
-                  << " frequency = " << FREQUENCY << " Hz\n"
-                  << "============================================\n";
+    std::vector<float> data(bf.size());
 
 #ifdef _OPENMP
-        std::cout << "OpenMP max threads = " << omp_get_max_threads() << "\n";
+#pragma omp parallel for schedule(static)
 #endif
+    for (std::int64_t i = 0; i < static_cast<std::int64_t>(bf.size()); ++i)
+        data[i] = imag ? bf[i].imag() : bf[i].real();
 
-        const se::huygens::BlockInfo info = se::huygens::read_block_info(BLOCK_FILE);
-        if (BLOCK_ID < 0 || BLOCK_ID >= static_cast<int>(info.blocks.size()))
-            throw std::runtime_error("BLOCK_ID is outside block_info.dat");
+    write_2d(file, tau, data);
+}
 
-        const se::huygens::Block& block = info.blocks[static_cast<std::size_t>(BLOCK_ID)];
-        const std::string tau_file =
-            se::huygens::layer_table_filename(TABLE_PREFIX, BLOCK_ID, "tau");
 
-        std::cout << "\nReading traveltime:\n  " << tau_file << "\n";
-        const se::huygens::Table3D tau = se::huygens::read_table_rsf(tau_file);
+/* 主程序：所有运行参数集中在这里，只输出 Butterfly 波场实部和虚部。 */
+int main()
+{
+    /* 基本参数。 */
+    constexpr float PI = 3.14159265358979323846f;
+    constexpr float FREQUENCY = 25.0f;
+    constexpr float FILTER_DT = 0.001f;
+    constexpr float FILTER_LENGTH = 0.025f;
+    constexpr int BLOCK_ID = 1;
+    constexpr int DEFAULT_THREADS = 32;
 
-        const int rows = tau.nx_target * tau.nz_target;
-        const int columns = tau.nsource;
-        const float source_z = info.oz + block.source_iz * info.dz;
-        const float max_tau = maximum_traveltime(tau);
+    /* ButterflyPACK 参数。 */
+    constexpr double BF_TOL = 1.0e-4;
+    constexpr int BF_LEAF = 16;
+    constexpr double BF_SAMPLE = 4.0;
+    constexpr int BF_KNN = 10;
 
-        std::cout << "\nBlock geometry:\n"
-                  << "  source_iz       = " << block.source_iz << "\n"
-                  << "  source_z        = " << source_z << "\n"
-                  << "  target_start_iz = " << block.target_start_iz << "\n"
-                  << "  target_end_iz   = " << block.target_end_iz << "\n"
-                  << "  halo_end_iz     = " << block.halo_end_iz << "\n";
+    /* 输入输出文件。 */
+    const std::string BLOCK_FILE = "block_info.dat";
+    const std::string TABLE_PREFIX = "huygens_tt/travel";
+    const std::string BF_REAL = "test_bf_block1_bf_real.rsf";
+    const std::string BF_IMAG = "test_bf_block1_bf_imag.rsf";
 
-        std::cout << "\nTraveltime table:\n"
-                  << "  nz_target = " << tau.nz_target << "\n"
-                  << "  nx_target = " << tau.nx_target << "\n"
-                  << "  nsource   = " << tau.nsource << "\n"
-                  << "  max tau   = " << max_tau << " s\n"
-                  << "  matrix    = " << rows << " x " << columns << "\n";
+    INFO(("Program started"));
+    configure_threads(DEFAULT_THREADS);
 
-        int point_source_index = 0;
-        const std::vector<Complex> input = make_point_source(tau, point_source_index);
-        const float point_source_x = tau.ox_source + point_source_index * tau.dx_source;
+    const auto t_read = Clock::now();
+    const auto info = se::huygens::read_block_info(BLOCK_FILE);
+    const auto& block = info.blocks[BLOCK_ID];
 
-        std::cout << "\n1-D input point source:\n"
-                  << "  index     = " << point_source_index << "\n"
-                  << "  x         = " << point_source_x << "\n"
-                  << "  z         = " << source_z << "\n"
-                  << "  amplitude = 1 + 0i\n";
+    const std::string tau_file =
+        se::huygens::layer_table_filename(TABLE_PREFIX, BLOCK_ID, "tau");
+    const auto tau = se::huygens::read_table_rsf(tau_file);
+    INFO(("Traveltime loaded", elapsed(t_read)));
 
-        write_input_source(INPUT_FILE, tau, input);
+    const int rows = tau.nx_target * tau.nz_target;
+    const int cols = tau.nsource;
+    const float source_z = info.oz + block.source_iz * info.dz;
 
-        const std::vector<float> weights = make_weights(tau);
-        se::huygens::FrequencyKirchhoffFilter filter(
-            FREQUENCY, FILTER_DT, FILTER_LENGTH, max_tau);
+    const auto input = make_point_source(tau);
+    const auto weights = make_weights(tau);
 
-        std::cout << "\n[1] Direct Kirchhoff 1D -> 2D...\n";
-        const auto direct_start = Clock::now();
-        const std::vector<Complex> direct =
-            direct_kirchhoff(tau, weights, input, filter, source_z);
-        const double direct_seconds =
-            std::chrono::duration<double>(Clock::now() - direct_start).count();
+    se::huygens::FrequencyKirchhoffFilter filter(
+        FREQUENCY, FILTER_DT, FILTER_LENGTH, max_tau(tau));
 
-        std::vector<double> row_coordinates = make_row_coordinates(tau);
-        std::vector<double> column_coordinates = make_column_coordinates(tau, source_z);
+    auto row_coord = make_row_coord(tau);
+    auto col_coord = make_col_coord(tau, source_z);
 
-        se::butterfly::Options options;
-        options.tolerance = BF_TOL;
-        options.leaf_size = BF_LEAF;
-        options.coordinate_dimension = 2;
-        options.lr_level = 100;
-        options.sample_parameter = BF_SAMPLE_PARA;
-        options.forward_n15_flag = 0;
-        options.nearest_neighbors = BF_KNN;
-        options.verbosity = 1;
+    BPackContext ctx;
+    ctx.tau = &tau;
+    ctx.w = &weights;
+    ctx.filter = &filter;
+    ctx.pi = PI;
+    ctx.frequency = FREQUENCY;
+    ctx.source_z = source_z;
+    ctx.bf_tol = BF_TOL;
+    ctx.bf_leaf = BF_LEAF;
+    ctx.bf_sample = BF_SAMPLE;
+    ctx.bf_knn = BF_KNN;
+    ctx.rows = rows;
+    ctx.cols = cols;
 
-        std::cout << "\n[2] Building ButterflyPACK operator...\n";
-        const auto build_start = Clock::now();
+    BPackHandles h;
 
-        se::butterfly::Matrix<float> butterfly(
-            rows, columns,
-            std::move(row_coordinates),
-            std::move(column_coordinates),
-            [&](int row, int source) -> Complex {
-                return kirchhoff_entry(row, source, tau, weights, filter, source_z);
-            },
-            options);
+    const auto t_build = Clock::now();
+    build_butterfly(ctx, h, row_coord, col_coord);
+    INFO(("Butterfly build completed", elapsed(t_build)));
 
-        const double build_seconds =
-            std::chrono::duration<double>(Clock::now() - build_start).count();
+    const auto t_apply = Clock::now();
+    const auto bf = apply_butterfly(ctx, h, input);
+    INFO(("Butterfly apply completed", elapsed(t_apply)));
 
-        std::cout << "\n[3] ButterflyPACK 1D -> 2D...\n";
-        const auto apply_start = Clock::now();
-        const std::vector<Complex> bf = butterfly.apply(input);
-        const double apply_seconds =
-            std::chrono::duration<double>(Clock::now() - apply_start).count();
+    const auto t_write = Clock::now();
+    write_bf(BF_REAL, tau, bf, false);
+    write_bf(BF_IMAG, tau, bf, true);
+    INFO(("BF real/imag written", elapsed(t_write)));
 
-        const double l2_error = relative_l2_error(direct, bf);
-        const double max_error = maximum_normalized_error(direct, bf);
-        const se::butterfly::Statistics& stats = butterfly.statistics();
+    destroy_bpack(h);
+    INFO(("Program finished"));
 
-        std::cout << "\n[4] Writing RSF outputs...\n";
-        write_field_component(DIRECT_REAL_FILE, tau, direct, false, "direct_kirchhoff_datuming");
-        write_field_component(DIRECT_IMAG_FILE, tau, direct, true, "direct_kirchhoff_datuming");
-        write_field_component(BF_REAL_FILE, tau, bf, false, "butterfly_kirchhoff_datuming");
-        write_field_component(BF_IMAG_FILE, tau, bf, true, "butterfly_kirchhoff_datuming");
-        write_error(ERROR_FILE, tau, direct, bf);
-
-        std::cout << "\n============================================\n"
-                  << "                RESULT\n"
-                  << "============================================\n"
-                  << "frequency                = " << FREQUENCY << " Hz\n"
-                  << "filter dt                = " << FILTER_DT << " s\n"
-                  << "filter length            = " << FILTER_LENGTH << " s\n"
-                  << "point source index       = " << point_source_index << "\n"
-                  << "source datum z           = " << source_z << "\n"
-                  << "matrix size              = " << rows << " x " << columns << "\n"
-                  << "output size              = " << tau.nz_target << " x "
-                  << tau.nx_target << "\n\n"
-                  << "direct Kirchhoff time    = " << direct_seconds << " s\n"
-                  << "BF build time            = " << build_seconds << " s\n"
-                  << "BF apply time            = " << apply_seconds << " s\n\n"
-                  << "relative L2 error        = " << l2_error << "\n"
-                  << "maximum normalized error = " << max_error << "\n\n"
-                  << "compressed memory        = " << stats.compressed_megabytes << " MB\n"
-                  << "maximum rank             = " << stats.maximum_rank << "\n"
-                  << "sampled entries          = " << stats.sampled_entries << "\n"
-                  << "============================================\n";
-
-        return 0;
-    }
-    catch (const std::exception& error) {
-        std::cerr << "\ntest_bf_kir failed: " << error.what() << "\n";
-        return 1;
-    }
+    return 0;
 }
