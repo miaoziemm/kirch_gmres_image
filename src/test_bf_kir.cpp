@@ -455,9 +455,9 @@ int main()
     constexpr int DEFAULT_THREADS = 32;
 
     /* ButterflyPACK 参数。 */
-    constexpr double BF_TOL = 1.0e-4;
-    constexpr int BF_LEAF = 16;
-    constexpr double BF_SAMPLE = 4.0;
+    constexpr double BF_TOL = 1.0e-1;
+    constexpr int BF_LEAF = 64;
+    constexpr double BF_SAMPLE = 1;
     constexpr int BF_KNN = 10;
 
     /* 输入输出文件。 */
