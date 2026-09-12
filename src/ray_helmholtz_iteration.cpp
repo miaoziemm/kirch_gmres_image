@@ -73,18 +73,21 @@ static void print_help(const char* program_name)
         "  max_iterations=4             (truncated FGMRES steps)\n"
         "  tolerance=0.15               (relative to initial defect)\n"
         "  anchor_rows=8                (fixed ray rows below source)\n"
-        "  sweep_block_rows=32\n"
-        "  sweep_overlap_rows=8         (must be >= 4 for FD8)\n"
-        "  shift_beta=0.10\n"
-        "  ilut_drop_tolerance=1e-2\n"
-        "  ilut_fill_factor=10\n"
+        "  sweep_block_rows=64\n"
+        "  sweep_overlap_rows=12        (must be >= 4 for FD8)\n"
+        "  sweep_refinements=1          (MR refinements per direction)\n"
+        "  shift_beta=0.05\n"
+        "  ilut_drop_tolerance=3e-3\n"
+        "  ilut_fill_factor=16\n"
         "  scale_radius=4\n"
         "  write_iterations=1           (0 avoids iteration I/O)\n"
-        "  write_correction=1\n\n"
+        "  write_correction=1\n"
+        "  write_update=0               (write each incremental update)\n\n"
         "Outputs:\n"
         "  PREFIX_traveltime.rsf\n"
         "  PREFIX_iter_NNN_real.rsf / PREFIX_iter_NNN_imag.rsf\n"
         "  PREFIX_correction_NNN_real.rsf / _imag.rsf\n"
+        "  PREFIX_update_NNN_real.rsf / _imag.rsf\n"
         "  PREFIX_metrics.csv\n",
         program_name);
 }
@@ -563,6 +566,58 @@ static Vector apply_downward_sweep(
 }
 
 
+/*
+ * 对一个 FGMRES 搜索方向做一次或多次扫掠精化。
+ *
+ * 单次向下扫掠给出 z=P_down^{-1}v。局部 ILUT 较稀疏时，z 对 v 的
+ * 解释可能过弱，因此继续计算方向残差
+ *
+ *     q = v-A*z,
+ *     p = P_down^{-1}q.
+ *
+ * 但不能简单采用 z=z+p，因为局部块近似并不保证单位步长稳定。
+ * 这里在真实 Helmholtz 算子下计算最优复数步长
+ *
+ *     alpha = (A*p)^H q / ||A*p||^2,
+ *
+ * 再令 z=z+alpha*p。这样每次精化都不会增大 ||v-A*z||，同时仍然
+ * 只使用向下扫掠，不引入反向传播。
+ */
+static Vector apply_refined_downward_sweep(
+    const Sparse& active_helmholtz,
+    const std::vector<SweepBlock>& blocks,
+    const Vector& rhs,
+    int refinements)
+{
+    Vector direction = apply_downward_sweep(
+        active_helmholtz,
+        blocks,
+        rhs);
+
+    for (int refinement = 0; refinement < refinements; ++refinement) {
+        Vector direction_residual =
+            rhs - active_helmholtz * direction;
+        Vector direction_update = apply_downward_sweep(
+            active_helmholtz,
+            blocks,
+            direction_residual);
+        Vector update_action =
+            active_helmholtz * direction_update;
+        double denominator = update_action.squaredNorm();
+
+        if (denominator <= std::numeric_limits<double>::epsilon()) {
+            break;
+        }
+
+        Complex alpha =
+            update_action.dot(direction_residual) / denominator;
+        direction += alpha * direction_update;
+    }
+
+    return direction;
+}
+
+
 /* 把活动区域中的校正量放回带 PML 的完整计算网格。 */
 static Vector make_padded_correction(
     const Vector& active_correction,
@@ -690,9 +745,9 @@ int main(int argc, char** argv)
         float tolerance = se_have_par("tolerance")
             ? se_get_par_float("tolerance") : 0.15f;
         float shift_beta = se_have_par("shift_beta")
-            ? se_get_par_float("shift_beta") : 0.10f;
+            ? se_get_par_float("shift_beta") : 0.05f;
         float ilut_drop_tolerance = se_have_par("ilut_drop_tolerance")
-            ? se_get_par_float("ilut_drop_tolerance") : 1.0e-2f;
+            ? se_get_par_float("ilut_drop_tolerance") : 3.0e-3f;
 
         int source_ix = se_have_par("source_ix")
             ? se_get_par_int("source_ix") : -1;
@@ -703,17 +758,21 @@ int main(int argc, char** argv)
         int anchor_rows = se_have_par("anchor_rows")
             ? se_get_par_int("anchor_rows") : 8;
         int sweep_block_rows = se_have_par("sweep_block_rows")
-            ? se_get_par_int("sweep_block_rows") : 32;
+            ? se_get_par_int("sweep_block_rows") : 64;
         int sweep_overlap_rows = se_have_par("sweep_overlap_rows")
-            ? se_get_par_int("sweep_overlap_rows") : 8;
+            ? se_get_par_int("sweep_overlap_rows") : 12;
+        int sweep_refinements = se_have_par("sweep_refinements")
+            ? se_get_par_int("sweep_refinements") : 1;
         int scale_radius = se_have_par("scale_radius")
             ? se_get_par_int("scale_radius") : 4;
         int ilut_fill_factor = se_have_par("ilut_fill_factor")
-            ? se_get_par_int("ilut_fill_factor") : 10;
+            ? se_get_par_int("ilut_fill_factor") : 16;
         int write_iterations = se_have_par("write_iterations")
             ? se_get_par_int("write_iterations") : 1;
         int write_correction = se_have_par("write_correction")
             ? se_get_par_int("write_correction") : 1;
+        int write_update = se_have_par("write_update")
+            ? se_get_par_int("write_update") : 0;
 
         if (frequency <= 0.0f || source_amplitude == 0.0f ||
             tolerance <= 0.0f || tolerance >= 1.0f ||
@@ -722,6 +781,7 @@ int main(int argc, char** argv)
             anchor_rows < 5 || sweep_block_rows < 8 ||
             sweep_overlap_rows < 4 ||
             sweep_overlap_rows >= sweep_block_rows ||
+            sweep_refinements < 0 || sweep_refinements > 3 ||
             scale_radius < 0) {
             throw std::runtime_error("invalid command-line parameter");
         }
@@ -759,6 +819,8 @@ int main(int argc, char** argv)
         std::printf(
             "method: ray anchor + downward RAS sweep + FGMRES(%d)\n",
             max_iterations);
+        std::printf(
+            "solver revision: ray_fgmres_v2_refined_sweep\n");
 
         /* -------------------- 3. 计算并输出首波走时 -------------------- */
 
@@ -930,11 +992,11 @@ int main(int argc, char** argv)
         std::fprintf(
             metrics_file,
             "iteration,relative_defect,defect_ratio,krylov_estimate,"
-            "relative_correction,ray_correlation,solve_seconds,"
-            "output_seconds\n");
+            "relative_correction,relative_update,max_abs_update,"
+            "ray_correlation,solve_seconds,output_seconds\n");
         std::fprintf(
             metrics_file,
-            "0,1.0,1.0,1.0,0.0,1.0,0.0,0.0\n");
+            "0,1.0,1.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0\n");
         std::fflush(metrics_file);
 
         std::printf("FMM time: %.6f s\n", fmm_seconds);
@@ -955,11 +1017,17 @@ int main(int argc, char** argv)
             active_count);
         std::printf(
             "downward sweep: blocks=%lld block_rows=%d overlap=%d "
-            "setup=%.6f s\n",
+            "refinements=%d setup=%.6f s\n",
             static_cast<long long>(sweep_blocks.size()),
             sweep_block_rows,
             sweep_overlap_rows,
+            sweep_refinements,
             preconditioner_seconds);
+        std::printf(
+            "local ILUT: shift_beta=%g drop=%g fill=%d\n",
+            shift_beta,
+            ilut_drop_tolerance,
+            ilut_fill_factor);
         std::printf(
             "iteration 0: active defect=%.6e (normalized=1)\n",
             initial_defect_norm);
@@ -1004,10 +1072,11 @@ int main(int argc, char** argv)
             Clock::time_point step_start = Clock::now();
 
             /* z_j=P_down^{-1}v_j：一次预条件应用完成一次向下扫掠。 */
-            Vector direction = apply_downward_sweep(
+            Vector direction = apply_refined_downward_sweep(
                 active_helmholtz,
                 sweep_blocks,
-                residual_basis[static_cast<std::size_t>(column)]);
+                residual_basis[static_cast<std::size_t>(column)],
+                sweep_refinements);
 
             if (direction.norm() <=
                 std::numeric_limits<double>::epsilon()) {
@@ -1064,6 +1133,12 @@ int main(int argc, char** argv)
                 defect_scale;
             double relative_correction =
                 candidate_correction.norm() / ray_active_norm;
+            Vector iteration_update =
+                candidate_correction - active_correction;
+            double relative_update =
+                iteration_update.norm() / ray_active_norm;
+            double max_abs_update =
+                iteration_update.cwiseAbs().maxCoeff();
 
             Vector candidate_active_wavefield =
                 initial_wavefield.segment(active_offset, active_count) +
@@ -1082,6 +1157,10 @@ int main(int argc, char** argv)
 
             Vector padded_correction = make_padded_correction(
                 active_correction,
+                helmholtz.rows(),
+                active_offset);
+            Vector padded_update = make_padded_correction(
+                iteration_update,
                 helmholtz.rows(),
                 active_offset);
             wavefield = initial_wavefield + padded_correction;
@@ -1109,17 +1188,31 @@ int main(int argc, char** argv)
                         frequency,
                         "downward_multipath_correction");
                 }
+
+                if (write_update != 0) {
+                    write_wavefield(
+                        output_prefix,
+                        "update",
+                        used,
+                        model,
+                        padded_update,
+                        frequency,
+                        "incremental_downward_fgmres_update");
+                }
             }
             cumulative_output_seconds += elapsed_seconds(output_start);
 
             std::fprintf(
                 metrics_file,
-                "%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
+                "%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,"
+                "%.12e,%.12e,%.12e\n",
                 used,
                 relative_defect,
                 defect_ratio,
                 krylov_estimate,
                 relative_correction,
+                relative_update,
+                max_abs_update,
                 ray_correlation,
                 cumulative_solve_seconds,
                 cumulative_output_seconds);
@@ -1127,11 +1220,14 @@ int main(int argc, char** argv)
 
             std::printf(
                 "iteration %d: defect=%.6e ratio=%.6e "
-                "correction/ray=%.6e ray_corr=%.6e\n",
+                "correction/ray=%.6e update/ray=%.6e "
+                "max_update=%.6e ray_corr=%.6e\n",
                 used,
                 relative_defect,
                 defect_ratio,
                 relative_correction,
+                relative_update,
+                max_abs_update,
                 ray_correlation);
 
             if (next_norm <=
