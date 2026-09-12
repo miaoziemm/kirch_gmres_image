@@ -448,7 +448,7 @@ int main()
 {
     /* 基本参数。 */
     constexpr float PI = 3.14159265358979323846f;
-    constexpr float FREQUENCY = 25.0f;
+    constexpr float FREQUENCY = 35.0f;
     constexpr float FILTER_DT = 0.001f;
     constexpr float FILTER_LENGTH = 0.025f;
     constexpr int BLOCK_ID = 1;
@@ -457,8 +457,8 @@ int main()
     /* ButterflyPACK 参数。 */
     constexpr double BF_TOL = 1.0e-4;
     constexpr int BF_LEAF = 64;
-    constexpr double BF_SAMPLE = 0.1;
-    constexpr int BF_KNN = 10;
+    constexpr double BF_SAMPLE = 4;
+    constexpr int BF_KNN = 0;
 
     /* 输入输出文件。 */
     const std::string BLOCK_FILE = "block_info.dat";
