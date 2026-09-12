@@ -455,9 +455,9 @@ int main()
     constexpr int DEFAULT_THREADS = 32;
 
     /* ButterflyPACK 参数。 */
-    constexpr double BF_TOL = 1.0e-1;
+    constexpr double BF_TOL = 1.0e-4;
     constexpr int BF_LEAF = 64;
-    constexpr double BF_SAMPLE = 1;
+    constexpr double BF_SAMPLE = 0.1;
     constexpr int BF_KNN = 10;
 
     /* 输入输出文件。 */
@@ -476,7 +476,7 @@ int main()
     const std::string tau_file =
         se::huygens::layer_table_filename(TABLE_PREFIX, BLOCK_ID, "tau");
     const auto tau = se::huygens::read_table_rsf(tau_file);
-    INFO(("Traveltime loaded", elapsed(t_read)));
+    INFO(("Traveltime loaded %f", elapsed(t_read)));
 
     const int rows = tau.nx_target * tau.nz_target;
     const int cols = tau.nsource;
@@ -509,16 +509,16 @@ int main()
 
     const auto t_build = Clock::now();
     build_butterfly(ctx, h, row_coord, col_coord);
-    INFO(("Butterfly build completed", elapsed(t_build)));
+    INFO(("Butterfly build completed %f", elapsed(t_build)));
 
     const auto t_apply = Clock::now();
     const auto bf = apply_butterfly(ctx, h, input);
-    INFO(("Butterfly apply completed", elapsed(t_apply)));
+    INFO(("Butterfly apply completed %f", elapsed(t_apply)));
 
     const auto t_write = Clock::now();
     write_bf(BF_REAL, tau, bf, false);
     write_bf(BF_IMAG, tau, bf, true);
-    INFO(("BF real/imag written", elapsed(t_write)));
+    INFO(("BF real/imag written %f", elapsed(t_write)));
 
     destroy_bpack(h);
     INFO(("Program finished"));
