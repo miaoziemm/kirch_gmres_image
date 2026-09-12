@@ -9,6 +9,7 @@
 #include <global_preconditioned_gmres.hpp>
 
 #include <Eigen/IterativeLinearSolvers>
+#include <Eigen/QR>
 
 #include <algorithm>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -26,8 +28,9 @@
  * --------
  * 1. 使用项目已有的 eFMM 计算点源首波走时；
  * 2. 根据首波走时构造指定频率的射线近似波场；
- * 3. 将射线场作为初值，对全局 Helmholtz 方程做少量残差校正；
- * 4. 输出初始场、每次迭代后的总场以及累计校正场。
+ * 3. 在震源下方固定一段射线场，把它作为向下延拓的边界；
+ * 4. 使用重叠深度块的向下扫掠预条件器和截断 FGMRES 做少量校正；
+ * 5. 输出初始场、每次迭代后的总场以及累计校正场。
  *
  * 程序采用面向过程的组织方式。命令行参数通过项目已有的
  * se_par_init、se_have_par、se_get_par_* 函数读取。
@@ -53,7 +56,7 @@ static const double RAY_PHASE = -0.75 * PI;
  * 打印程序参数说明。
  *
  * 除了 -h 和 --help 外，其他参数都采用项目已有的 key=value 形式，
- * 例如：frequency=15 source_ix=512 tolerance=1e-3。
+ * 例如：frequency=15 source_ix=512 max_iterations=4。
  */
 static void print_help(const char* program_name)
 {
@@ -67,18 +70,24 @@ static void print_help(const char* program_name)
         "  source_amplitude=1\n"
         "  source_ix=-1                 (-1 means nx/2)\n"
         "  source_iz=1\n"
-        "  max_iterations=8\n"
-        "  tolerance=1e-3\n"
-        "  preconditioner=ilut          (ilut, diagonal, identity)\n"
-        "  shift_beta=0.10\n"
-        "  ilut_drop_tolerance=1e-2\n"
-        "  ilut_fill_factor=10\n"
+        "  max_iterations=4             (truncated FGMRES steps)\n"
+        "  tolerance=0.15               (relative to initial defect)\n"
+        "  anchor_rows=8                (fixed ray rows below source)\n"
+        "  sweep_block_rows=64\n"
+        "  sweep_overlap_rows=12        (must be >= 4 for FD8)\n"
+        "  sweep_refinements=1          (MR refinements per direction)\n"
+        "  shift_beta=0.05\n"
+        "  ilut_drop_tolerance=3e-3\n"
+        "  ilut_fill_factor=16\n"
         "  scale_radius=4\n"
-        "  write_correction=1\n\n"
+        "  write_iterations=1           (0 avoids iteration I/O)\n"
+        "  write_correction=1\n"
+        "  write_update=0               (write each incremental update)\n\n"
         "Outputs:\n"
         "  PREFIX_traveltime.rsf\n"
         "  PREFIX_iter_NNN_real.rsf / PREFIX_iter_NNN_imag.rsf\n"
         "  PREFIX_correction_NNN_real.rsf / _imag.rsf\n"
+        "  PREFIX_update_NNN_real.rsf / _imag.rsf\n"
         "  PREFIX_metrics.csv\n",
         program_name);
 }
@@ -376,6 +385,252 @@ static Sparse build_shifted_helmholtz(
 }
 
 
+/*
+ * 从稀疏矩阵中提取连续未知量对应的主子矩阵。
+ *
+ * 深度方向采用整行网格划分，因此一个深度块在一维编号中恰好是
+ * 连续区间。显式提取可以避免依赖 Eigen 稀疏 block 表达式的具体
+ * 求值行为，也便于后面重复构造重叠深度块。
+ */
+static Sparse extract_principal_block(
+    const Sparse& matrix,
+    int first,
+    int count)
+{
+    if (first < 0 || count < 1 || first + count > matrix.rows()) {
+        throw std::runtime_error("invalid sparse principal block");
+    }
+
+    std::vector<gpg::Triplet> entries;
+    entries.reserve(static_cast<std::size_t>(
+        matrix.nonZeros() * static_cast<double>(count) / matrix.rows()));
+
+    int last = first + count;
+
+    for (int column = first; column < last; ++column) {
+        for (Sparse::InnerIterator value(matrix, column); value; ++value) {
+            if (value.row() >= first && value.row() < last) {
+                entries.emplace_back(
+                    value.row() - first,
+                    column - first,
+                    value.value());
+            }
+        }
+    }
+
+    Sparse block(count, count);
+    block.setFromTriplets(entries.begin(), entries.end());
+    block.makeCompressed();
+    return block;
+}
+
+
+/*
+ * 一个重叠深度块只保存索引和已经构造好的 ILUT 因子。
+ *
+ * core 区间在所有块之间互不重叠，extended 区间在 core 两侧增加
+ * overlap 行。局部方程在 extended 区间求解，但只把 core 部分写回，
+ * 即 restricted additive Schwarz (RAS) 的限制写回方式。
+ */
+struct SweepBlock {
+    int core_first = 0;
+    int core_last = 0;
+    int extended_first = 0;
+    int extended_count = 0;
+    std::unique_ptr<Eigen::IncompleteLUT<Complex, int>> ilut;
+};
+
+
+/*
+ * 为向下扫掠预条件器建立所有局部 ILUT 因子。
+ *
+ * 与全局 ILUT 相比，每个因子只对应几十个深度网格行，因而建立
+ * 更快、峰值内存更小。复数偏移只用于局部预条件矩阵；FGMRES 的
+ * Arnoldi 运算和真实残差始终使用未偏移的 Helmholtz 算子。
+ */
+static std::vector<SweepBlock> build_downward_sweep_blocks(
+    const Sparse& active_helmholtz,
+    const std::vector<float>& active_velocity,
+    int active_nz,
+    int nx,
+    float frequency,
+    int block_rows,
+    int overlap_rows,
+    float shift_beta,
+    float ilut_drop_tolerance,
+    int ilut_fill_factor)
+{
+    Sparse shifted = build_shifted_helmholtz(
+        active_helmholtz,
+        active_velocity,
+        active_nz,
+        nx,
+        frequency,
+        shift_beta);
+
+    std::vector<SweepBlock> blocks;
+
+    for (int core_first_z = 0;
+         core_first_z < active_nz;
+         core_first_z += block_rows) {
+
+        int core_last_z = std::min(active_nz, core_first_z + block_rows);
+        int extended_first_z =
+            std::max(0, core_first_z - overlap_rows);
+        int extended_last_z =
+            std::min(active_nz, core_last_z + overlap_rows);
+
+        SweepBlock block;
+        block.core_first = core_first_z * nx;
+        block.core_last = core_last_z * nx;
+        block.extended_first = extended_first_z * nx;
+        block.extended_count =
+            (extended_last_z - extended_first_z) * nx;
+
+        Sparse local_matrix = extract_principal_block(
+            shifted,
+            block.extended_first,
+            block.extended_count);
+
+        block.ilut =
+            std::make_unique<Eigen::IncompleteLUT<Complex, int>>();
+        block.ilut->setDroptol(ilut_drop_tolerance);
+        block.ilut->setFillfactor(ilut_fill_factor);
+        block.ilut->compute(local_matrix);
+
+        if (block.ilut->info() != Eigen::Success) {
+            throw std::runtime_error(
+                "local sweep ILUT construction failed; increase "
+                "shift_beta or ilut_fill_factor");
+        }
+
+        blocks.push_back(std::move(block));
+    }
+
+    return blocks;
+}
+
+
+/*
+ * 对一个向量应用一次自上而下的乘法 RAS 扫掠。
+ *
+ * work 保存尚未解释的残差。每个局部解只写回本块 core 区域，随后
+ * 立即从 work 中减去真实算子 A 作用于该更新的结果。下一个深度块
+ * 因而接收到上方块传来的界面残差。由于只从浅到深走一遍，不进行
+ * 反向扫掠，预条件器会优先传递下行能量，符合本程序只快速补充
+ * 下行多路径的目标。
+ *
+ * 矩阵为列主序。所有 core 列互不重叠，因此一整次扫掠对 A 的
+ * 非零元总访问量约等于一次稀疏矩阵向量乘法，而不是“块数次”全局
+ * 矩阵向量乘法。
+ */
+static Vector apply_downward_sweep(
+    const Sparse& active_helmholtz,
+    const std::vector<SweepBlock>& blocks,
+    const Vector& rhs)
+{
+    Vector correction = Vector::Zero(rhs.size());
+    Vector work = rhs;
+
+    for (std::size_t iblock = 0; iblock < blocks.size(); ++iblock) {
+        const SweepBlock& block = blocks[iblock];
+
+        Vector local_rhs = work.segment(
+            block.extended_first,
+            block.extended_count);
+        Vector local_solution = block.ilut->solve(local_rhs);
+
+        if (block.ilut->info() != Eigen::Success) {
+            throw std::runtime_error("local sweep ILUT solve failed");
+        }
+
+        for (int column = block.core_first;
+             column < block.core_last;
+             ++column) {
+
+            Complex update = local_solution[
+                column - block.extended_first];
+            correction[column] += update;
+
+            if (update == Complex(0.0, 0.0)) continue;
+
+            for (Sparse::InnerIterator value(active_helmholtz, column);
+                 value;
+                 ++value) {
+                work[value.row()] -= value.value() * update;
+            }
+        }
+    }
+
+    return correction;
+}
+
+
+/*
+ * 对一个 FGMRES 搜索方向做一次或多次扫掠精化。
+ *
+ * 单次向下扫掠给出 z=P_down^{-1}v。局部 ILUT 较稀疏时，z 对 v 的
+ * 解释可能过弱，因此继续计算方向残差
+ *
+ *     q = v-A*z,
+ *     p = P_down^{-1}q.
+ *
+ * 但不能简单采用 z=z+p，因为局部块近似并不保证单位步长稳定。
+ * 这里在真实 Helmholtz 算子下计算最优复数步长
+ *
+ *     alpha = (A*p)^H q / ||A*p||^2,
+ *
+ * 再令 z=z+alpha*p。这样每次精化都不会增大 ||v-A*z||，同时仍然
+ * 只使用向下扫掠，不引入反向传播。
+ */
+static Vector apply_refined_downward_sweep(
+    const Sparse& active_helmholtz,
+    const std::vector<SweepBlock>& blocks,
+    const Vector& rhs,
+    int refinements)
+{
+    Vector direction = apply_downward_sweep(
+        active_helmholtz,
+        blocks,
+        rhs);
+
+    for (int refinement = 0; refinement < refinements; ++refinement) {
+        Vector direction_residual =
+            rhs - active_helmholtz * direction;
+        Vector direction_update = apply_downward_sweep(
+            active_helmholtz,
+            blocks,
+            direction_residual);
+        Vector update_action =
+            active_helmholtz * direction_update;
+        double denominator = update_action.squaredNorm();
+
+        if (denominator <= std::numeric_limits<double>::epsilon()) {
+            break;
+        }
+
+        Complex alpha =
+            update_action.dot(direction_residual) / denominator;
+        direction += alpha * direction_update;
+    }
+
+    return direction;
+}
+
+
+/* 把活动区域中的校正量放回带 PML 的完整计算网格。 */
+static Vector make_padded_correction(
+    const Vector& active_correction,
+    int padded_count,
+    int active_offset)
+{
+    Vector padded = Vector::Zero(padded_count);
+    padded.segment(active_offset, active_correction.size()) =
+        active_correction;
+    return padded;
+}
+
+
 /* 从带吸收层的计算区域中截取原始物理模型区域。 */
 static std::vector<se::huygens::Complex> crop_wavefield(
     const Vector& padded_wavefield,
@@ -483,51 +738,52 @@ int main(int argc, char** argv)
         const char* output_prefix = se_have_par("output_prefix")
             ? se_get_par_str("output_prefix")
             : "output/ray_helmholtz";
-        const char* preconditioner = se_have_par("preconditioner")
-            ? se_get_par_str("preconditioner")
-            : "ilut";
-
         float frequency = se_have_par("frequency")
             ? se_get_par_float("frequency") : 15.0f;
         float source_amplitude = se_have_par("source_amplitude")
             ? se_get_par_float("source_amplitude") : 1.0f;
         float tolerance = se_have_par("tolerance")
-            ? se_get_par_float("tolerance") : 1.0e-3f;
+            ? se_get_par_float("tolerance") : 0.15f;
         float shift_beta = se_have_par("shift_beta")
-            ? se_get_par_float("shift_beta") : 0.10f;
+            ? se_get_par_float("shift_beta") : 0.05f;
         float ilut_drop_tolerance = se_have_par("ilut_drop_tolerance")
-            ? se_get_par_float("ilut_drop_tolerance") : 1.0e-2f;
+            ? se_get_par_float("ilut_drop_tolerance") : 3.0e-3f;
 
         int source_ix = se_have_par("source_ix")
             ? se_get_par_int("source_ix") : -1;
         int source_iz = se_have_par("source_iz")
             ? se_get_par_int("source_iz") : 1;
         int max_iterations = se_have_par("max_iterations")
-            ? se_get_par_int("max_iterations") : 8;
+            ? se_get_par_int("max_iterations") : 4;
+        int anchor_rows = se_have_par("anchor_rows")
+            ? se_get_par_int("anchor_rows") : 8;
+        int sweep_block_rows = se_have_par("sweep_block_rows")
+            ? se_get_par_int("sweep_block_rows") : 64;
+        int sweep_overlap_rows = se_have_par("sweep_overlap_rows")
+            ? se_get_par_int("sweep_overlap_rows") : 12;
+        int sweep_refinements = se_have_par("sweep_refinements")
+            ? se_get_par_int("sweep_refinements") : 1;
         int scale_radius = se_have_par("scale_radius")
             ? se_get_par_int("scale_radius") : 4;
         int ilut_fill_factor = se_have_par("ilut_fill_factor")
-            ? se_get_par_int("ilut_fill_factor") : 10;
+            ? se_get_par_int("ilut_fill_factor") : 16;
+        int write_iterations = se_have_par("write_iterations")
+            ? se_get_par_int("write_iterations") : 1;
         int write_correction = se_have_par("write_correction")
             ? se_get_par_int("write_correction") : 1;
-
-        /* 后续判断使用整数标志，避免在循环中反复比较字符串。 */
-        int use_ilut = std::strcmp(preconditioner, "ilut") == 0;
-        int use_diagonal =
-            std::strcmp(preconditioner, "diagonal") == 0;
-        int use_identity =
-            std::strcmp(preconditioner, "identity") == 0;
+        int write_update = se_have_par("write_update")
+            ? se_get_par_int("write_update") : 0;
 
         if (frequency <= 0.0f || source_amplitude == 0.0f ||
-            tolerance <= 0.0f || shift_beta < 0.0f ||
-            ilut_drop_tolerance < 0.0f || ilut_fill_factor < 1 ||
-            max_iterations < 1 || scale_radius < 0) {
+            tolerance <= 0.0f || tolerance >= 1.0f ||
+            shift_beta < 0.0f || ilut_drop_tolerance <= 0.0f ||
+            ilut_fill_factor < 1 || max_iterations < 1 ||
+            anchor_rows < 5 || sweep_block_rows < 8 ||
+            sweep_overlap_rows < 4 ||
+            sweep_overlap_rows >= sweep_block_rows ||
+            sweep_refinements < 0 || sweep_refinements > 3 ||
+            scale_radius < 0) {
             throw std::runtime_error("invalid command-line parameter");
-        }
-
-        if (!use_ilut && !use_diagonal && !use_identity) {
-            throw std::runtime_error(
-                "preconditioner must be ilut, diagonal, or identity");
         }
 
         /* -------------------- 2. 读取RSF速度模型 -------------------- */
@@ -544,6 +800,11 @@ int main(int argc, char** argv)
                 "source index is outside the velocity model");
         }
 
+        if (source_iz + anchor_rows >= model.nz - 4) {
+            throw std::runtime_error(
+                "anchor_rows leaves no usable correction domain");
+        }
+
         std::printf(
             "model: nz=%d nx=%d dz=%g dx=%g\n",
             model.nz,
@@ -555,6 +816,11 @@ int main(int argc, char** argv)
             source_iz,
             source_ix,
             frequency);
+        std::printf(
+            "method: ray anchor + downward RAS sweep + FGMRES(%d)\n",
+            max_iterations);
+        std::printf(
+            "solver revision: ray_fgmres_v2_refined_sweep\n");
 
         /* -------------------- 3. 计算并输出首波走时 -------------------- */
 
@@ -651,66 +917,63 @@ int main(int argc, char** argv)
             frequency,
             "fmm_ray_initial_wavefield");
 
-        /* 使用原始Helmholtz矩阵计算真实残差。 */
-        Vector residual = rhs - helmholtz * wavefield;
-        double rhs_norm = std::max(
-            rhs.norm(), std::numeric_limits<double>::epsilon());
-        double relative_residual = residual.norm() / rhs_norm;
+        /* -------------------- 6. 建立射线锚定的活动校正方程 -------------------- */
 
-        /* -------------------- 6. 构造所选择的预条件器 -------------------- */
+        /*
+         * 震源及其下方 anchor_rows 行完全保留射线场，不参与校正。
+         * 这样可以避免点源奇异性和射线振幅误差占据最前面的迭代，
+         * 同时把保留下来的射线场作为下部 Helmholtz 方程的边界数据。
+         */
+        int active_first_model_iz = source_iz + anchor_rows;
+        int active_first_padded_iz =
+            active_first_model_iz + gpg::kPml;
+        int active_offset = active_first_padded_iz * padded_nx;
+        int active_nz = padded_nz - active_first_padded_iz;
+        int active_count = active_nz * padded_nx;
+
+        Sparse active_helmholtz = extract_principal_block(
+            helmholtz,
+            active_offset,
+            active_count);
+
+        Vector full_initial_residual = rhs - helmholtz * initial_wavefield;
+        Vector correction_rhs = full_initial_residual.segment(
+            active_offset,
+            active_count);
+
+        std::vector<float> active_velocity(
+            padded_velocity.begin() + active_offset,
+            padded_velocity.end());
+
+        double initial_defect_norm = correction_rhs.norm();
+        double defect_scale = std::max(
+            initial_defect_norm,
+            std::numeric_limits<double>::epsilon());
+        double ray_active_norm = std::max(
+            initial_wavefield.segment(active_offset, active_count).norm(),
+            std::numeric_limits<double>::epsilon());
+
+        /* -------------------- 7. 构造向下扫掠预条件器 -------------------- */
 
         Clock::time_point preconditioner_start = Clock::now();
 
-        Eigen::IncompleteLUT<Complex, int> ilut;
-        Vector diagonal;
-
-        /*
-         * ILUT 和对角预条件都基于 shifted-Helmholtz 矩阵。
-         * identity 不需要构造 shifted 矩阵，也没有额外的准备开销。
-         */
-        if (use_ilut || use_diagonal) {
-            Sparse shifted_helmholtz = build_shifted_helmholtz(
-                helmholtz,
-                padded_velocity,
-                padded_nz,
+        std::vector<SweepBlock> sweep_blocks =
+            build_downward_sweep_blocks(
+                active_helmholtz,
+                active_velocity,
+                active_nz,
                 padded_nx,
                 frequency,
-                shift_beta);
-
-            if (use_ilut) {
-                ilut.setDroptol(ilut_drop_tolerance);
-                ilut.setFillfactor(ilut_fill_factor);
-                ilut.compute(shifted_helmholtz);
-
-                if (ilut.info() != Eigen::Success) {
-                    throw std::runtime_error(
-                        "ILUT construction failed; try increasing "
-                        "shift_beta or use preconditioner=diagonal");
-                }
-            }
-            else {
-                /* Jacobi 预条件：只保存 shifted 矩阵的主对角线。 */
-                diagonal.resize(shifted_helmholtz.rows());
-
-                for (Eigen::Index row = 0;
-                     row < shifted_helmholtz.rows();
-                     ++row) {
-                    diagonal[row] =
-                        shifted_helmholtz.coeff(row, row);
-
-                    if (std::abs(diagonal[row]) <=
-                        std::numeric_limits<double>::epsilon()) {
-                        throw std::runtime_error(
-                            "zero diagonal in Jacobi preconditioner");
-                    }
-                }
-            }
-        }
+                sweep_block_rows,
+                sweep_overlap_rows,
+                shift_beta,
+                ilut_drop_tolerance,
+                ilut_fill_factor);
 
         double preconditioner_seconds =
             elapsed_seconds(preconditioner_start);
 
-        /* -------------------- 7. 建立收敛信息文件 -------------------- */
+        /* -------------------- 8. 建立收敛信息文件 -------------------- */
 
         char metrics_name[4096];
         std::snprintf(
@@ -728,12 +991,12 @@ int main(int argc, char** argv)
 
         std::fprintf(
             metrics_file,
-            "iteration,relative_residual,residual_ratio,"
-            "relative_correction,alpha_real,alpha_imag,seconds\n");
+            "iteration,relative_defect,defect_ratio,krylov_estimate,"
+            "relative_correction,relative_update,max_abs_update,"
+            "ray_correlation,solve_seconds,output_seconds\n");
         std::fprintf(
             metrics_file,
-            "0,%.12e,1.0,0.0,0.0,0.0,0.0\n",
-            relative_residual);
+            "0,1.0,1.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0\n");
         std::fflush(metrics_file);
 
         std::printf("FMM time: %.6f s\n", fmm_seconds);
@@ -747,144 +1010,268 @@ int main(int argc, char** argv)
             ray_scale.real(),
             ray_scale.imag());
         std::printf(
-            "preconditioner: %s, setup time: %.6f s\n",
-            preconditioner,
+            "active correction: first model iz=%d, nz=%d, "
+            "unknowns=%d\n",
+            active_first_model_iz,
+            active_nz,
+            active_count);
+        std::printf(
+            "downward sweep: blocks=%lld block_rows=%d overlap=%d "
+            "refinements=%d setup=%.6f s\n",
+            static_cast<long long>(sweep_blocks.size()),
+            sweep_block_rows,
+            sweep_overlap_rows,
+            sweep_refinements,
             preconditioner_seconds);
         std::printf(
-            "iteration 0: relative residual=%.6e\n",
-            relative_residual);
+            "local ILUT: shift_beta=%g drop=%g fill=%d\n",
+            shift_beta,
+            ilut_drop_tolerance,
+            ilut_fill_factor);
+        std::printf(
+            "iteration 0: active defect=%.6e (normalized=1)\n",
+            initial_defect_norm);
 
-        /* -------------------- 8. 开始残差校正迭代 -------------------- */
+        /* -------------------- 9. 截断 FGMRES 残差校正 -------------------- */
 
         /*
-         * 每次迭代执行：
+         * 在活动区域求解校正方程
          *
-         *     z       = M^{-1} r
-         *     w       = A z
-         *     alpha   = w^H r / w^H w
-         *     u       = u + alpha*z
-         *     r       = b - A u
+         *     A_active * delta = r_ray.
          *
-         * 其中 alpha 是当前校正方向上的最优复数步长，可使本次更新后
-         * 的二范数残差最小。它比固定松弛因子更适合量级尚不完全一致
-         * 的射线初场。
+         * FGMRES 保存所有已经得到的向下扫掠方向，并在这些方向张成的
+         * Krylov 子空间中同时求最小残差解。与原程序每次只保留一个
+         * M^{-1}r 方向相比，少量迭代也能组合出不同传播路径。
          */
-        Clock::time_point iteration_start = Clock::now();
+        Vector active_correction = Vector::Zero(active_count);
+        double relative_defect = initial_defect_norm > 0.0 ? 1.0 : 0.0;
+        double previous_defect_norm = defect_scale;
+        double cumulative_solve_seconds = 0.0;
+        double cumulative_output_seconds = 0.0;
+        int completed_iterations = 0;
 
-        for (int iteration = 1;
-             iteration <= max_iterations &&
-             relative_residual > tolerance;
-             ++iteration) {
+        std::vector<Vector> residual_basis;
+        std::vector<Vector> sweep_basis;
+        residual_basis.reserve(static_cast<std::size_t>(max_iterations + 1));
+        sweep_basis.reserve(static_cast<std::size_t>(max_iterations));
 
-            Vector direction;
+        Eigen::MatrixXcd hessenberg = Eigen::MatrixXcd::Zero(
+            max_iterations + 1,
+            max_iterations);
 
-            if (use_ilut) {
-                /* z=M^{-1}r：使用 shifted-Helmholtz ILUT。 */
-                direction = ilut.solve(residual);
+        if (initial_defect_norm >
+            std::numeric_limits<double>::epsilon()) {
+            residual_basis.push_back(correction_rhs / initial_defect_norm);
+        }
 
-                if (ilut.info() != Eigen::Success) {
-                    throw std::runtime_error(
-                        "ILUT triangular solve failed");
-                }
-            }
-            else if (use_diagonal) {
-                /* Jacobi 预条件，每个网格点只进行一次复数除法。 */
-                direction = residual.array() / diagonal.array();
-            }
-            else {
-                /* identity：不使用预条件器，直接采用残差方向。 */
-                direction = residual;
-            }
+        for (int column = 0;
+             column < max_iterations && relative_defect > tolerance &&
+             !residual_basis.empty();
+             ++column) {
 
-            /* 计算校正方向经过真实Helmholtz算子后的结果。 */
-            Vector action = helmholtz * direction;
-            double denominator = action.squaredNorm();
+            Clock::time_point step_start = Clock::now();
 
-            if (denominator <= std::numeric_limits<double>::epsilon()) {
+            /* z_j=P_down^{-1}v_j：一次预条件应用完成一次向下扫掠。 */
+            Vector direction = apply_refined_downward_sweep(
+                active_helmholtz,
+                sweep_blocks,
+                residual_basis[static_cast<std::size_t>(column)],
+                sweep_refinements);
+
+            if (direction.norm() <=
+                std::numeric_limits<double>::epsilon()) {
                 std::printf(
-                    "iteration stopped: correction direction vanished\n");
+                    "FGMRES stopped: sweep direction vanished\n");
                 break;
             }
 
-            /* 当前方向上的最优复数步长。 */
-            Complex alpha = action.dot(residual) / denominator;
+            sweep_basis.push_back(std::move(direction));
+            Vector next = active_helmholtz * sweep_basis.back();
 
-            /* 更新总波场，并重新计算真实残差，避免递推残差累积误差。 */
-            wavefield += alpha * direction;
-            residual = rhs - helmholtz * wavefield;
+            /* 两次改进 Gram-Schmidt，减少少量 Krylov 向量的失正交。 */
+            for (int pass = 0; pass < 2; ++pass) {
+                for (int row = 0; row <= column; ++row) {
+                    Complex coefficient =
+                        residual_basis[static_cast<std::size_t>(row)].dot(next);
+                    hessenberg(row, column) += coefficient;
+                    next -= coefficient *
+                        residual_basis[static_cast<std::size_t>(row)];
+                }
+            }
 
-            double previous_residual = relative_residual;
-            relative_residual = residual.norm() / rhs_norm;
-            double residual_ratio = relative_residual /
+            double next_norm = next.norm();
+            hessenberg(column + 1, column) = next_norm;
+
+            int used = column + 1;
+            Vector small_rhs = Vector::Zero(used + 1);
+            small_rhs[0] = initial_defect_norm;
+
+            Eigen::MatrixXcd small_hessenberg =
+                hessenberg.topLeftCorner(used + 1, used);
+            Vector coefficients = small_hessenberg
+                .colPivHouseholderQr()
+                .solve(small_rhs);
+
+            Vector candidate_correction = Vector::Zero(active_count);
+            for (int index = 0; index < used; ++index) {
+                candidate_correction +=
+                    coefficients[index] *
+                    sweep_basis[static_cast<std::size_t>(index)];
+            }
+
+            /* 始终用真实未偏移算子重新计算残差。 */
+            Vector candidate_residual =
+                correction_rhs - active_helmholtz * candidate_correction;
+            double candidate_defect_norm = candidate_residual.norm();
+            relative_defect = candidate_defect_norm / defect_scale;
+            double defect_ratio = candidate_defect_norm /
                 std::max(
-                    previous_residual,
+                    previous_defect_norm,
                     std::numeric_limits<double>::epsilon());
+            double krylov_estimate =
+                (small_rhs - small_hessenberg * coefficients).norm() /
+                defect_scale;
+            double relative_correction =
+                candidate_correction.norm() / ray_active_norm;
+            Vector iteration_update =
+                candidate_correction - active_correction;
+            double relative_update =
+                iteration_update.norm() / ray_active_norm;
+            double max_abs_update =
+                iteration_update.cwiseAbs().maxCoeff();
 
-            /*
-             * 累计校正量与射线初场的比值。该值仅用于诊断，不会限制
-             * 或缩放实际校正量。
-             */
-            Vector correction = wavefield - initial_wavefield;
-            double relative_correction = correction.norm() /
-                std::max(
-                    initial_wavefield.norm(),
-                    std::numeric_limits<double>::epsilon());
-            double iteration_seconds = elapsed_seconds(iteration_start);
+            Vector candidate_active_wavefield =
+                initial_wavefield.segment(active_offset, active_count) +
+                candidate_correction;
+            double candidate_active_norm = std::max(
+                candidate_active_wavefield.norm(),
+                std::numeric_limits<double>::epsilon());
+            double ray_correlation = std::abs(
+                initial_wavefield.segment(active_offset, active_count)
+                    .dot(candidate_active_wavefield)) /
+                (ray_active_norm * candidate_active_norm);
 
-            /* 保存本次迭代后的完整总波场。 */
+            active_correction = std::move(candidate_correction);
+            previous_defect_norm = candidate_defect_norm;
+            completed_iterations = used;
+
+            Vector padded_correction = make_padded_correction(
+                active_correction,
+                helmholtz.rows(),
+                active_offset);
+            Vector padded_update = make_padded_correction(
+                iteration_update,
+                helmholtz.rows(),
+                active_offset);
+            wavefield = initial_wavefield + padded_correction;
+
+            cumulative_solve_seconds += elapsed_seconds(step_start);
+
+            Clock::time_point output_start = Clock::now();
+            if (write_iterations != 0) {
+                write_wavefield(
+                    output_prefix,
+                    "iter",
+                    used,
+                    model,
+                    wavefield,
+                    frequency,
+                    "ray_anchored_downward_sweep_fgmres");
+
+                if (write_correction != 0) {
+                    write_wavefield(
+                        output_prefix,
+                        "correction",
+                        used,
+                        model,
+                        padded_correction,
+                        frequency,
+                        "downward_multipath_correction");
+                }
+
+                if (write_update != 0) {
+                    write_wavefield(
+                        output_prefix,
+                        "update",
+                        used,
+                        model,
+                        padded_update,
+                        frequency,
+                        "incremental_downward_fgmres_update");
+                }
+            }
+            cumulative_output_seconds += elapsed_seconds(output_start);
+
+            std::fprintf(
+                metrics_file,
+                "%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,"
+                "%.12e,%.12e,%.12e\n",
+                used,
+                relative_defect,
+                defect_ratio,
+                krylov_estimate,
+                relative_correction,
+                relative_update,
+                max_abs_update,
+                ray_correlation,
+                cumulative_solve_seconds,
+                cumulative_output_seconds);
+            std::fflush(metrics_file);
+
+            std::printf(
+                "iteration %d: defect=%.6e ratio=%.6e "
+                "correction/ray=%.6e update/ray=%.6e "
+                "max_update=%.6e ray_corr=%.6e\n",
+                used,
+                relative_defect,
+                defect_ratio,
+                relative_correction,
+                relative_update,
+                max_abs_update,
+                ray_correlation);
+
+            if (next_norm <=
+                std::numeric_limits<double>::epsilon()) {
+                std::printf("FGMRES stopped: Arnoldi breakdown\n");
+                break;
+            }
+
+            residual_basis.push_back(next / next_norm);
+        }
+
+        /* write_iterations=0 时只写最终结果，避免逐步 RSF I/O。 */
+        if (write_iterations == 0 && completed_iterations > 0) {
+            Vector padded_correction = make_padded_correction(
+                active_correction,
+                helmholtz.rows(),
+                active_offset);
             write_wavefield(
                 output_prefix,
                 "iter",
-                iteration,
+                completed_iterations,
                 model,
                 wavefield,
                 frequency,
-                "ray_initialized_minimum_residual_iteration");
-
-            /*
-             * 单独保存累计校正场。多路径通常弱于首波，因此观察
-             * correction 文件往往比直接观察总场更清楚。
-             */
+                "ray_anchored_downward_sweep_fgmres");
             if (write_correction != 0) {
                 write_wavefield(
                     output_prefix,
                     "correction",
-                    iteration,
+                    completed_iterations,
                     model,
-                    correction,
+                    padded_correction,
                     frequency,
-                    "cumulative_helmholtz_correction");
+                    "downward_multipath_correction");
             }
-
-            std::fprintf(
-                metrics_file,
-                "%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
-                iteration,
-                relative_residual,
-                residual_ratio,
-                relative_correction,
-                alpha.real(),
-                alpha.imag(),
-                iteration_seconds);
-            std::fflush(metrics_file);
-
-            std::printf(
-                "iteration %d: residual=%.6e ratio=%.6e "
-                "correction/ray=%.6e alpha=%.6e%+.6ei\n",
-                iteration,
-                relative_residual,
-                residual_ratio,
-                relative_correction,
-                alpha.real(),
-                alpha.imag());
         }
 
         std::fclose(metrics_file);
         metrics_file = NULL;
 
         std::printf(
-            "finished: final relative residual=%.6e\n",
-            relative_residual);
+            "finished: FGMRES steps=%d final relative defect=%.6e\n",
+            completed_iterations,
+            relative_defect);
         std::printf(
             "traveltime: %s_traveltime.rsf\n",
             output_prefix);
