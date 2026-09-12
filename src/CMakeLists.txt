@@ -56,6 +56,23 @@ target_link_libraries(
 
 
 # ============================================================
+# Ray-initialized global Helmholtz iteration
+# ============================================================
+
+kirch_add_application(
+    ray_helmholtz_iteration
+    ray_helmholtz_iteration.cpp
+)
+
+target_link_libraries(
+    ray_helmholtz_iteration
+    PRIVATE
+        Kirch::reckirch
+        Kirch::selinear
+)
+
+
+# ============================================================
 # Shared SEWAVE implementation
 # ============================================================
 
