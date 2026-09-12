@@ -1,910 +1,1085 @@
 /*
- * 这是使用项目 se_par_* 参数接口的最终版本。
- * 本文件不包含 Arguments 类、Parameters 结构体或自定义 key=value 解析器。
+ * ray_helmholtz_iteration.cpp
+ *
+ * Purpose
+ * -------
+ * 1. Read the existing block information and precomputed traveltime tables.
+ * 2. Use the repository's 1-D butterfly factorization to propagate only the
+ *    wavefield on the upper datum of each block to the lower datum.
+ * 3. Reconstruct the volume wavefield inside the block with a local
+ *    Helmholtz solve.  The butterfly traces are therefore used as interface
+ *    data, instead of evaluating a Kirchhoff integral at every volume point.
+ * 4. March downward block by block.  A positive overlap is recommended: the
+ *    next datum then lies inside the previously corrected block, so the local
+ *    Helmholtz correction is fed back into the next butterfly propagation.
+ * 5. Write the assembled wavefield and diagnostic residual information.
+ *
+ * This is deliberately a prototype of the interface-trace idea.  It tests the
+ * most useful part of the polarized-trace paper for this repository: solve in
+ * the volume from interface data, while keeping the expensive oscillatory
+ * propagation on lower-dimensional interfaces.  It is not yet the full
+ * bidirectional polarized-trace GMRES system of Zepeda-Nunez & Demanet (2016).
  */
 
 #include <SEBASIC/include/se_basic.h>
+#include <SEFILESYSTEM/include/se_fs.h>
 #include <SEFILESYSTEM/include/se_par_sep.h>
+#include <SERECKIRCH/include/bf1d.h>
 #include <SERECKIRCH/include/huygens_sweep.hpp>
-#include <global_preconditioned_gmres.hpp>
-
-#include <Eigen/IterativeLinearSolvers>
+#include <se_eigen.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <limits>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
-/*
- * 程序功能
- * --------
- * 1. 使用项目已有的 eFMM 计算点源首波走时；
- * 2. 根据首波走时构造指定频率的射线近似波场；
- * 3. 将射线场作为初值，对全局 Helmholtz 方程做少量残差校正；
- * 4. 输出初始场、每次迭代后的总场以及累计校正场。
- *
- * 程序采用面向过程的组织方式。命令行参数通过项目已有的
- * se_par_init、se_have_par、se_get_par_* 函数读取。
- */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
-namespace gpg = global_preconditioned_gmres;
+namespace {
 
-typedef gpg::Complex Complex;
-typedef gpg::Sparse Sparse;
-typedef gpg::Vector Vector;
-typedef std::chrono::steady_clock Clock;
+using Clock = std::chrono::steady_clock;
+using Complex = se::huygens::Complex;
+using EigenVector = se::eigen::DenseVector<double>;
+using EigenMatrix = se::eigen::SparseMatrix<double>;
+using FFTStorage = std::vector<float>;
 
-static const double PI = 3.141592653589793238462643383279502884;
+constexpr double kPi = 3.141592653589793238462643383279502884;
 
-/*
- * 与仓库中 point_ray 使用的射线相位常数保持一致。
- * 射线波场采用 exp[i(omega*T-3*pi/4)] 的形式。
- */
-static const double RAY_PHASE = -0.75 * PI;
+struct FactorDeleter {
+    void operator()(BFStrictSegmentedFactor* factor) const
+    {
+        bf1d_strict_segmented_destroy(factor);
+    }
+};
+using FactorPointer = std::unique_ptr<BFStrictSegmentedFactor, FactorDeleter>;
 
+struct LocalHelmholtzSystem {
+    int top_iz = 0;
+    int bottom_iz = 0;
+    int nx_interior = 0;
+    int nz_interior = 0;
+    double coefficient_x = 0.0;
+    double coefficient_z = 0.0;
+    EigenMatrix matrix;
 
-/*
- * 打印程序参数说明。
- *
- * 除了 -h 和 --help 外，其他参数都采用项目已有的 key=value 形式，
- * 例如：frequency=15 source_ix=512 tolerance=1e-3。
- */
-static void print_help(const char* program_name)
-{
-    std::printf(
-        "Usage:\n"
-        "  %s [key=value ...]\n\n"
-        "Parameters:\n"
-        "  velocity=model/vmar.rsf\n"
-        "  output_prefix=output/ray_helmholtz\n"
-        "  frequency=15\n"
-        "  source_amplitude=1\n"
-        "  source_ix=-1                 (-1 means nx/2)\n"
-        "  source_iz=1\n"
-        "  max_iterations=8\n"
-        "  tolerance=1e-3\n"
-        "  preconditioner=ilut          (ilut, diagonal, identity)\n"
-        "  shift_beta=0.10\n"
-        "  ilut_drop_tolerance=1e-2\n"
-        "  ilut_fill_factor=10\n"
-        "  scale_radius=4\n"
-        "  write_correction=1\n\n"
-        "Outputs:\n"
-        "  PREFIX_traveltime.rsf\n"
-        "  PREFIX_iter_NNN_real.rsf / PREFIX_iter_NNN_imag.rsf\n"
-        "  PREFIX_correction_NNN_real.rsf / _imag.rsf\n"
-        "  PREFIX_metrics.csv\n",
-        program_name);
-}
-
-
-/*
- * -h 和 --help 不是 key=value 参数，因此只在这里单独判断。
- * 数值参数和文件名参数仍全部交给 se_par_* 系列函数读取。
- */
-static int have_help_argument(int argc, char** argv)
-{
-    for (int i = 1; i < argc; ++i) {
-        if (argv[i] == NULL) continue;
-
-        if (std::strcmp(argv[i], "-h") == 0 ||
-            std::strcmp(argv[i], "--help") == 0) {
-            return 1;
-        }
+    int unknowns() const noexcept
+    {
+        return nx_interior * nz_interior;
     }
 
-    if (se_have_par("help")) {
-        return se_get_par_int("help") != 0;
+    int row(int ix, int iz) const
+    {
+        return (iz - top_iz - 1) * nx_interior + (ix - 1);
     }
+};
 
-    return 0;
-}
+struct CorrectionMetrics {
+    double residual_before = 0.0;
+    double residual_after = 0.0;
+    double residual_ratio = 1.0;
+    double relative_update = 0.0;
+    double relaxation = 0.0;
+    int real_iterations = 0;
+    int imag_iterations = 0;
+    se::eigen::SolverStatus real_status = se::eigen::SolverStatus::success;
+    se::eigen::SolverStatus imag_status = se::eigen::SolverStatus::success;
+};
 
+struct ResidualSummary {
+    double relative_residual = 0.0;
+    double bulk_rms = 0.0;
+    double seam_rms = 0.0;
+    double seam_to_bulk = 0.0;
+};
 
-/* 返回从 started 到当前时刻经过的秒数。 */
 static double elapsed_seconds(const Clock::time_point& started)
 {
     return std::chrono::duration<double>(Clock::now() - started).count();
 }
 
-
-/*
- * 在速度模型四周增加吸收层。
- *
- * 原始模型位于：
- *
- *     iz = pml ... pml+nz-1
- *     ix = pml ... pml+nx-1
- *
- * 吸收层中的速度取距离它最近的物理网格点速度，避免人为引入
- * 额外的速度突变。
- */
-static std::vector<float> pad_velocity(
-    const se::huygens::Model2D& model)
+static void print_help(const char* program)
 {
-    int pml = gpg::kPml;
-    int padded_nz = model.nz + 2 * pml;
-    int padded_nx = model.nx + 2 * pml;
+    std::printf(
+        "Usage:\n"
+        "  %s velocity=... block_file=... table_prefix=... [key=value ...]\n\n"
+        "Required:\n"
+        "  velocity=MODEL.rsf\n"
+        "  block_file=block_info.dat\n"
+        "  table_prefix=huygens_tt/travel\n\n"
+        "Main parameters:\n"
+        "  output_prefix=output/ray_helmholtz_iteration\n"
+        "  frequency=25\n"
+        "  source_ix=-1                 (-1 means nx/2)\n"
+        "  source_iz=0                  (prototype requires surface source)\n"
+        "  source_amplitude=1\n"
+        "  source_radius=0\n\n"
+        "Butterfly parameters:\n"
+        "  bf_p=12\n"
+        "  bf_n_leaf=16\n"
+        "  bf_panel_levels=1\n"
+        "  bf_amp_eps=1e-20\n"
+        "  bf_phase_tol=1\n"
+        "  filter_dt=0.001\n"
+        "  filter_length=0.025\n"
+        "  filter_lookup_subsamples=64\n\n"
+        "Local Helmholtz correction:\n"
+        "  iter_cycles=3\n"
+        "  iter_iterations=10\n"
+        "  iter_restart=10\n"
+        "  iter_tolerance=1e-4\n"
+        "  iter_preconditioner=diagonal   (identity, diagonal, ilut)\n"
+        "  iter_ilut_drop_tolerance=1e-3\n"
+        "  iter_ilut_fill_factor=10\n"
+        "  iter_relaxation=-1             (-1 = residual-minimizing)\n"
+        "  iter_max_relaxation=1\n\n"
+        "Output/debug:\n"
+        "  write_interfaces=1\n"
+        "  write_each_block=0\n"
+        "  threads=0                     (0 keeps OpenMP default)\n\n",
+        program);
+}
 
-    std::vector<float> padded_velocity(
-        static_cast<std::size_t>(padded_nz) * padded_nx);
+static bool help_requested(int argc, char** argv)
+{
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] == nullptr) continue;
+        if (std::strcmp(argv[i], "-h") == 0 ||
+            std::strcmp(argv[i], "--help") == 0) {
+            return true;
+        }
+    }
+    return se_have_par("help") && se_get_par_int("help") != 0;
+}
 
-    for (int iz = 0; iz < padded_nz; ++iz) {
-        int model_iz = std::clamp(iz - pml, 0, model.nz - 1);
+static void set_threads(int threads)
+{
+#ifdef _OPENMP
+    if (threads > 0) {
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
+#else
+    (void)threads;
+#endif
+}
 
-        for (int ix = 0; ix < padded_nx; ++ix) {
-            int model_ix = std::clamp(ix - pml, 0, model.nx - 1);
-            int padded_index = gpg::index(iz, ix, padded_nx);
+static void copy_to_fftw(const std::vector<Complex>& input, FFTStorage& output)
+{
+    output.resize(2 * input.size());
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        output[2 * i] = input[i].real();
+        output[2 * i + 1] = input[i].imag();
+    }
+}
 
-            padded_velocity[static_cast<std::size_t>(padded_index)] =
-                model.velocity[model.index(model_ix, model_iz)];
+static void write_trace_component_rsf(const std::string& filename,
+                                      const se::huygens::Model2D& model,
+                                      const std::vector<Complex>& trace,
+                                      float frequency,
+                                      int block_id,
+                                      int iz,
+                                      const char* kind,
+                                      bool imaginary)
+{
+    if (static_cast<int>(trace.size()) != model.nx) {
+        throw std::invalid_argument("interface trace length does not equal nx");
+    }
+
+    se::huygens::ensure_parent_directory(filename);
+    std::vector<float> values(trace.size());
+    for (std::size_t i = 0; i < trace.size(); ++i) {
+        values[i] = imaginary ? trace[i].imag() : trace[i].real();
+    }
+
+    sep_t* output = sep_open(filename.c_str(), SEP_WRITE, 0);
+    if (output == nullptr || output->headers == nullptr ||
+        output->data == nullptr || output->data->io == nullptr) {
+        throw std::runtime_error("cannot create interface RSF: " + filename);
+    }
+
+    output->headers->ndim = 1;
+    output->headers->n[0] = model.nx;
+    output->headers->d[0] = model.dx;
+    output->headers->o[0] = model.ox;
+    output->headers->esize = 4;
+    output->headers->le = 1;
+    sep_set_header(output, "data_format", "native_float");
+    sep_set_header_int(output, "esize", 4);
+    sep_set_header(output, "label1", "Distance");
+    sep_set_header(output, "unit1", "m");
+    sep_set_header(output, "trace_kind", kind);
+    sep_set_header(output, "component", imaginary ? "imaginary" : "real");
+    sep_set_header_int(output, "block_id", block_id);
+    sep_set_header_int(output, "iz", iz);
+    sep_set_header_float(output, "depth", model.z(iz));
+    sep_set_header_float(output, "frequency", frequency);
+    se_fsio_write_float(output->data->io, values.data(), values.size());
+    sep_close(output);
+}
+
+static std::string block_trace_filename(const std::string& prefix,
+                                        int block_id,
+                                        const char* kind,
+                                        const char* component)
+{
+    std::ostringstream stream;
+    stream << prefix << "_block_" << std::setw(3) << std::setfill('0')
+           << block_id << '_' << kind << '_' << component << ".rsf";
+    return stream.str();
+}
+
+static std::string block_field_filename(const std::string& prefix,
+                                        int block_id,
+                                        const char* component)
+{
+    std::ostringstream stream;
+    stream << prefix << "_after_block_" << std::setw(3) << std::setfill('0')
+           << block_id << '_' << component << ".rsf";
+    return stream.str();
+}
+
+static FactorPointer build_bottom_interface_factor(
+    const se::huygens::Model2D& model,
+    const se::huygens::Block& block,
+    const se::huygens::LayerGeometry& geometry,
+    const se::huygens::OneWayLayerTables& tables,
+    const se::huygens::FrequencyKirchhoffFilter& filter,
+    float omega,
+    int p,
+    int leaf,
+    int panel_levels,
+    float amp_eps,
+    float phase_tol)
+{
+    if (static_cast<int>(geometry.source_ix.size()) != model.nx ||
+        static_cast<int>(geometry.target_ix.size()) != model.nx) {
+        throw std::runtime_error(
+            "interface butterfly requires one source/target per lateral grid point");
+    }
+
+    const auto target_it = std::find(
+        geometry.target_iz.begin(), geometry.target_iz.end(), block.target_end_iz);
+    if (target_it == geometry.target_iz.end()) {
+        throw std::runtime_error("target_end_iz is absent from the traveltime table");
+    }
+    const int target_depth_index = static_cast<int>(
+        std::distance(geometry.target_iz.begin(), target_it));
+    const int target_depth_count = static_cast<int>(geometry.target_iz.size());
+
+    const std::vector<float> weights =
+        se::huygens::trapezoidal_weights(model, geometry.source_ix);
+
+    se::huygens::OneWayKernelData kernel;
+    kernel.rows = static_cast<int>(geometry.targets.size());
+    kernel.sources = model.nx;
+    kernel.source_z = model.z(block.source_iz);
+    kernel.quadrature_weights = &weights;
+    kernel.tables = &tables;
+    kernel.filter = &filter;
+
+    std::vector<float> tau_storage(
+        static_cast<std::size_t>(model.nx) * model.nx);
+    std::vector<float*> tau_rows(static_cast<std::size_t>(model.nx));
+    FFTStorage amplitude(
+        2 * static_cast<std::size_t>(model.nx) * model.nx);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int ix_target = 0; ix_target < model.nx; ++ix_target) {
+        tau_rows[static_cast<std::size_t>(ix_target)] =
+            tau_storage.data() + static_cast<std::size_t>(ix_target) * model.nx;
+        const int row = ix_target * target_depth_count + target_depth_index;
+
+        for (int source = 0; source < model.nx; ++source) {
+            const std::size_t matrix_index =
+                static_cast<std::size_t>(ix_target) * model.nx + source;
+            const float tau = kernel.traveltime(row, source);
+            const Complex value = kernel.phase_removed_amplitude(row, source, tau);
+            tau_storage[matrix_index] = tau;
+            amplitude[2 * matrix_index] = value.real();
+            amplitude[2 * matrix_index + 1] = value.imag();
         }
     }
 
-    return padded_velocity;
+    BFStrictSegmentedFactor* raw = bf1d_strict_segmented_create_phase_amp(
+        model.nx,
+        tau_rows.data(),
+        reinterpret_cast<const fftwf_complex*>(amplitude.data()),
+        omega,
+        p,
+        leaf,
+        panel_levels,
+        amp_eps,
+        phase_tol);
+
+    if (raw == nullptr) {
+        throw std::runtime_error("butterfly factor construction returned null");
+    }
+    return FactorPointer(raw);
 }
 
-
-/*
- * 根据首波走时构造单频射线近似波场。
- *
- * 波场形式为
- *
- *     u_ray(x,z) = A(T) exp[i(omega*T-3*pi/4)],
- *
- * 其中二维渐近振幅取
- *
- *     A(T) = 1 / sqrt(8*pi*omega*T).
- *
- * 震源点处 T=0 会导致振幅奇异，因此使用一个网格间距对应的
- * 最小传播时间进行正则化。随后还会通过 calculate_ray_scale()
- * 将射线场与离散点源的振幅和相位进一步匹配。
- */
-static Vector build_ray_wavefield(
-    const se::huygens::Model2D& model,
-    const std::vector<float>& traveltime,
-    float frequency,
-    float source_amplitude,
-    int source_ix,
-    int source_iz)
+static std::vector<Complex> apply_bottom_interface_factor(
+    const BFStrictSegmentedFactor* factor,
+    const std::vector<Complex>& top)
 {
-    std::size_t ngrid =
-        static_cast<std::size_t>(model.nz) * model.nx;
-
-    if (traveltime.size() != ngrid) {
-        throw std::runtime_error(
-            "traveltime size does not match velocity model");
+    if (factor == nullptr) {
+        throw std::invalid_argument("null butterfly factor");
     }
 
-    double omega = 2.0 * PI * frequency;
-    double source_velocity =
-        model.velocity[model.index(source_ix, source_iz)];
+    FFTStorage input;
+    copy_to_fftw(top, input);
+    FFTStorage output(2 * top.size(), 0.0f);
 
-    /* 一个网格间距对应的传播时间，用于震源奇异性正则化。 */
-    double minimum_time =
-        std::max(model.dx, model.dz) / source_velocity;
+    bf1d_strict_segmented_apply(
+        factor,
+        reinterpret_cast<const fftwf_complex*>(input.data()),
+        reinterpret_cast<fftwf_complex*>(output.data()));
 
-    Vector ray_wavefield(static_cast<Eigen::Index>(ngrid));
+    std::vector<Complex> bottom(top.size());
+    for (std::size_t ix = 0; ix < bottom.size(); ++ix) {
+        bottom[ix] = Complex(output[2 * ix], output[2 * ix + 1]);
+    }
+    return bottom;
+}
 
-    for (int iz = 0; iz < model.nz; ++iz) {
+static LocalHelmholtzSystem build_local_system(
+    const se::huygens::Model2D& model,
+    const se::huygens::Block& block,
+    float frequency)
+{
+    LocalHelmholtzSystem system;
+    system.top_iz = block.source_iz;
+    system.bottom_iz = block.target_end_iz;
+    system.nx_interior = model.nx - 2;
+    system.nz_interior = system.bottom_iz - system.top_iz - 1;
+
+    if (system.nx_interior < 1 || system.nz_interior < 1) {
+        throw std::invalid_argument("local block has no Helmholtz interior");
+    }
+
+    system.coefficient_x = 1.0 /
+        (static_cast<double>(model.dx) * model.dx);
+    system.coefficient_z = 1.0 /
+        (static_cast<double>(model.dz) * model.dz);
+    const double omega = 2.0 * kPi * frequency;
+
+    std::vector<se::eigen::Triplet<double>> entries;
+    entries.reserve(static_cast<std::size_t>(system.unknowns()) * 5);
+
+    for (int iz = system.top_iz + 1; iz < system.bottom_iz; ++iz) {
+        for (int ix = 1; ix < model.nx - 1; ++ix) {
+            const int row = system.row(ix, iz);
+            const double velocity = model.velocity[model.index(ix, iz)];
+            const double wavenumber = omega / velocity;
+            const double diagonal = wavenumber * wavenumber -
+                2.0 * system.coefficient_x -
+                2.0 * system.coefficient_z;
+
+            entries.emplace_back(row, row, diagonal);
+            if (ix > 1) {
+                entries.emplace_back(
+                    row, system.row(ix - 1, iz), system.coefficient_x);
+            }
+            if (ix + 1 < model.nx - 1) {
+                entries.emplace_back(
+                    row, system.row(ix + 1, iz), system.coefficient_x);
+            }
+            if (iz > system.top_iz + 1) {
+                entries.emplace_back(
+                    row, system.row(ix, iz - 1), system.coefficient_z);
+            }
+            if (iz + 1 < system.bottom_iz) {
+                entries.emplace_back(
+                    row, system.row(ix, iz + 1), system.coefficient_z);
+            }
+        }
+    }
+
+    system.matrix = se::eigen::make_sparse_matrix<double>(
+        system.unknowns(), system.unknowns(), entries);
+    return system;
+}
+
+static void extract_local_vectors(
+    const se::huygens::Model2D& model,
+    const LocalHelmholtzSystem& system,
+    const std::vector<Complex>& wavefield,
+    EigenVector& real_values,
+    EigenVector& imag_values,
+    EigenVector& real_boundary_rhs,
+    EigenVector& imag_boundary_rhs)
+{
+    const int count = system.unknowns();
+    real_values.resize(count);
+    imag_values.resize(count);
+    real_boundary_rhs.setZero(count);
+    imag_boundary_rhs.setZero(count);
+
+    const auto add_boundary = [&](int row, double coefficient, const Complex& value) {
+        real_boundary_rhs[row] -= coefficient * static_cast<double>(value.real());
+        imag_boundary_rhs[row] -= coefficient * static_cast<double>(value.imag());
+    };
+
+    for (int iz = system.top_iz + 1; iz < system.bottom_iz; ++iz) {
+        for (int ix = 1; ix < model.nx - 1; ++ix) {
+            const int row = system.row(ix, iz);
+            const Complex value = wavefield[model.index(ix, iz)];
+            real_values[row] = value.real();
+            imag_values[row] = value.imag();
+
+            if (ix == 1) {
+                add_boundary(row, system.coefficient_x,
+                             wavefield[model.index(0, iz)]);
+            }
+            if (ix == model.nx - 2) {
+                add_boundary(row, system.coefficient_x,
+                             wavefield[model.index(model.nx - 1, iz)]);
+            }
+            if (iz == system.top_iz + 1) {
+                add_boundary(row, system.coefficient_z,
+                             wavefield[model.index(ix, system.top_iz)]);
+            }
+            if (iz == system.bottom_iz - 1) {
+                add_boundary(row, system.coefficient_z,
+                             wavefield[model.index(ix, system.bottom_iz)]);
+            }
+        }
+    }
+}
+
+static void write_local_values(
+    const se::huygens::Model2D& model,
+    const LocalHelmholtzSystem& system,
+    const EigenVector& real_values,
+    const EigenVector& imag_values,
+    std::vector<Complex>& wavefield)
+{
+    for (int iz = system.top_iz + 1; iz < system.bottom_iz; ++iz) {
+        for (int ix = 1; ix < model.nx - 1; ++ix) {
+            const int row = system.row(ix, iz);
+            wavefield[model.index(ix, iz)] = Complex(
+                static_cast<float>(real_values[row]),
+                static_cast<float>(imag_values[row]));
+        }
+    }
+}
+
+static bool all_finite(const EigenVector& values)
+{
+    for (Eigen::Index i = 0; i < values.size(); ++i) {
+        if (!std::isfinite(values[i])) return false;
+    }
+    return true;
+}
+
+static se::eigen::SolverResult<double> solve_component(
+    const EigenMatrix& matrix,
+    const EigenVector& rhs,
+    const se::eigen::SolverOptions& options)
+{
+    if (rhs.norm() <= std::numeric_limits<double>::min()) {
+        se::eigen::SolverResult<double> result;
+        result.solution = EigenVector::Zero(rhs.size());
+        result.report.status = se::eigen::SolverStatus::success;
+        result.report.relative_residual = 0.0;
+        result.report.estimated_error = 0.0;
+        return result;
+    }
+
+    return se::eigen::solve_iterative(
+        matrix, rhs, se::eigen::IterativeMethod::gmres, options);
+}
+
+static CorrectionMetrics correct_local_block(
+    const se::huygens::Model2D& model,
+    const LocalHelmholtzSystem& system,
+    std::vector<Complex>& wavefield,
+    const se::eigen::SolverOptions& options,
+    double requested_relaxation,
+    double maximum_relaxation)
+{
+    EigenVector real_values;
+    EigenVector imag_values;
+    EigenVector real_boundary_rhs;
+    EigenVector imag_boundary_rhs;
+    extract_local_vectors(
+        model, system, wavefield,
+        real_values, imag_values,
+        real_boundary_rhs, imag_boundary_rhs);
+
+    const EigenVector real_residual =
+        system.matrix * real_values - real_boundary_rhs;
+    const EigenVector imag_residual =
+        system.matrix * imag_values - imag_boundary_rhs;
+
+    CorrectionMetrics metrics;
+    metrics.residual_before = std::sqrt(
+        real_residual.squaredNorm() + imag_residual.squaredNorm());
+    metrics.residual_after = metrics.residual_before;
+
+    if (metrics.residual_before <= std::numeric_limits<double>::min()) {
+        return metrics;
+    }
+
+    const auto real_result = solve_component(
+        system.matrix, -real_residual, options);
+    const auto imag_result = solve_component(
+        system.matrix, -imag_residual, options);
+
+    metrics.real_iterations = real_result.report.iterations;
+    metrics.imag_iterations = imag_result.report.iterations;
+    metrics.real_status = real_result.report.status;
+    metrics.imag_status = imag_result.report.status;
+
+    if (!all_finite(real_result.solution) || !all_finite(imag_result.solution)) {
+        metrics.real_status = se::eigen::SolverStatus::numerical_issue;
+        metrics.imag_status = se::eigen::SolverStatus::numerical_issue;
+        return metrics;
+    }
+
+    const EigenVector real_action = system.matrix * real_result.solution;
+    const EigenVector imag_action = system.matrix * imag_result.solution;
+    const double action_norm_squared =
+        real_action.squaredNorm() + imag_action.squaredNorm();
+
+    double relaxation = requested_relaxation;
+    if (requested_relaxation < 0.0) {
+        if (action_norm_squared > std::numeric_limits<double>::min()) {
+            relaxation = -(
+                real_residual.dot(real_action) +
+                imag_residual.dot(imag_action)) / action_norm_squared;
+        } else {
+            relaxation = 0.0;
+        }
+        relaxation = std::clamp(relaxation, 0.0, maximum_relaxation);
+    }
+    if (!std::isfinite(relaxation)) relaxation = 0.0;
+    metrics.relaxation = relaxation;
+
+    const EigenVector corrected_real =
+        real_values + relaxation * real_result.solution;
+    const EigenVector corrected_imag =
+        imag_values + relaxation * imag_result.solution;
+    const EigenVector real_after = real_residual + relaxation * real_action;
+    const EigenVector imag_after = imag_residual + relaxation * imag_action;
+
+    metrics.residual_after = std::sqrt(
+        real_after.squaredNorm() + imag_after.squaredNorm());
+    metrics.residual_ratio = metrics.residual_after /
+        std::max(metrics.residual_before, std::numeric_limits<double>::min());
+
+    const double field_norm = std::sqrt(
+        real_values.squaredNorm() + imag_values.squaredNorm());
+    const double update_norm = std::abs(relaxation) * std::sqrt(
+        real_result.solution.squaredNorm() +
+        imag_result.solution.squaredNorm());
+    metrics.relative_update = update_norm /
+        std::max(field_norm, std::numeric_limits<double>::min());
+
+    if (all_finite(corrected_real) && all_finite(corrected_imag)) {
+        write_local_values(
+            model, system, corrected_real, corrected_imag, wavefield);
+    }
+    return metrics;
+}
+
+static std::vector<Complex> gather_row(
+    const se::huygens::Model2D& model,
+    const std::vector<Complex>& wavefield,
+    int iz)
+{
+    if (iz < 0 || iz >= model.nz) {
+        throw std::invalid_argument("gather_row iz is outside model");
+    }
+    std::vector<Complex> row(static_cast<std::size_t>(model.nx));
+    for (int ix = 0; ix < model.nx; ++ix) {
+        row[static_cast<std::size_t>(ix)] = wavefield[model.index(ix, iz)];
+    }
+    return row;
+}
+
+static void inject_row(const se::huygens::Model2D& model,
+                       std::vector<Complex>& wavefield,
+                       int iz,
+                       const std::vector<Complex>& row)
+{
+    if (iz < 0 || iz >= model.nz || static_cast<int>(row.size()) != model.nx) {
+        throw std::invalid_argument("inject_row dimensions are invalid");
+    }
+    for (int ix = 0; ix < model.nx; ++ix) {
+        wavefield[model.index(ix, iz)] = row[static_cast<std::size_t>(ix)];
+    }
+}
+
+static void initialize_block_guess(
+    const se::huygens::Model2D& model,
+    const se::huygens::Block& block,
+    const std::vector<Complex>& global_wavefield,
+    std::vector<Complex>& local_wavefield)
+{
+    const int top = block.source_iz;
+    const int bottom = block.target_end_iz;
+    const double denominator = std::max(1, bottom - top);
+
+    for (int iz = top + 1; iz < bottom; ++iz) {
+        const double t = static_cast<double>(iz - top) / denominator;
+        const bool keep_existing = iz < block.target_start_iz;
+
         for (int ix = 0; ix < model.nx; ++ix) {
-            std::size_t index = model.index(ix, iz);
-            double tau = std::max(
-                0.0, static_cast<double>(traveltime[index]));
-
-            if (!std::isfinite(tau)) {
-                throw std::runtime_error(
-                    "eFMM returned a non-finite traveltime");
+            const std::size_t index = model.index(ix, iz);
+            if (keep_existing) {
+                local_wavefield[index] = global_wavefield[index];
+                continue;
             }
 
-            double effective_time = std::max(tau, minimum_time);
-            double amplitude = source_amplitude /
-                std::sqrt(8.0 * PI * omega * effective_time);
-            double phase = omega * tau + RAY_PHASE;
-
-            ray_wavefield[static_cast<Eigen::Index>(index)] =
-                std::polar(amplitude, phase);
+            const Complex top_value = local_wavefield[model.index(ix, top)];
+            const Complex bottom_value = local_wavefield[model.index(ix, bottom)];
+            local_wavefield[index] =
+                static_cast<float>(1.0 - t) * top_value +
+                static_cast<float>(t) * bottom_value;
         }
     }
-
-    return ray_wavefield;
 }
 
-
-/*
- * 计算射线初场在吸收层中的余弦平方衰减系数。
- *
- * 物理区域内部返回 1；从物理边界向外逐渐减小；计算区域最外侧
- * 返回 0。这样可以减少未经处理的射线初场在外边界产生的残差。
- */
-static double pml_taper(int coordinate, int physical_count)
-{
-    int pml = gpg::kPml;
-    int physical_first = pml;
-    int physical_last = pml + physical_count - 1;
-    int outside_distance = 0;
-
-    if (coordinate < physical_first) {
-        outside_distance = physical_first - coordinate;
-    }
-    if (coordinate > physical_last) {
-        outside_distance = coordinate - physical_last;
-    }
-
-    if (outside_distance == 0) return 1.0;
-
-    double angle = 0.5 * PI *
-        static_cast<double>(outside_distance) / pml;
-    angle = std::min(angle, 0.5 * PI);
-
-    double value = std::cos(angle);
-    return value * value;
-}
-
-
-/*
- * 将物理模型中的射线场扩展到带吸收层的计算区域。
- *
- * 物理区域之外先复制最近边界处的波场，再乘以 pml_taper()，
- * 使初始波场在计算区域最外侧平滑衰减至零。
- */
-static Vector pad_wavefield(
-    const Vector& physical_wavefield,
-    const se::huygens::Model2D& model)
-{
-    int pml = gpg::kPml;
-    int padded_nz = model.nz + 2 * pml;
-    int padded_nx = model.nx + 2 * pml;
-
-    Vector padded_wavefield(
-        static_cast<Eigen::Index>(padded_nz) * padded_nx);
-
-    for (int iz = 0; iz < padded_nz; ++iz) {
-        int model_iz = std::clamp(iz - pml, 0, model.nz - 1);
-        double taper_z = pml_taper(iz, model.nz);
-
-        for (int ix = 0; ix < padded_nx; ++ix) {
-            int model_ix = std::clamp(ix - pml, 0, model.nx - 1);
-            double taper_x = pml_taper(ix, model.nx);
-            double taper = taper_z * taper_x;
-
-            int padded_index = gpg::index(iz, ix, padded_nx);
-            int physical_index =
-                gpg::index(model_iz, model_ix, model.nx);
-
-            padded_wavefield[padded_index] =
-                taper * physical_wavefield[physical_index];
-        }
-    }
-
-    return padded_wavefield;
-}
-
-
-/*
- * 在震源附近的小窗口内匹配射线场与离散点源。
- *
- * 设 v=A*u_ray，通过求解下面的一维复数最小二乘问题
- *
- *     min ||b-alpha*v||_2,
- *
- * 得到
- *
- *     alpha = v^H b / v^H v.
- *
- * 仅在震源附近拟合，是为了避免远处的高频渐近误差把射线场整体
- * 压缩得过小。
- */
-static Complex calculate_ray_scale(
-    const Vector& ray_action,
-    const Vector& rhs,
-    int padded_nz,
-    int padded_nx,
-    int source_iz,
-    int source_ix,
-    int scale_radius)
-{
-    Complex numerator(0.0, 0.0);
-    double denominator = 0.0;
-
-    int iz_begin = std::max(0, source_iz - scale_radius);
-    int iz_end = std::min(padded_nz - 1, source_iz + scale_radius);
-    int ix_begin = std::max(0, source_ix - scale_radius);
-    int ix_end = std::min(padded_nx - 1, source_ix + scale_radius);
-
-    for (int iz = iz_begin; iz <= iz_end; ++iz) {
-        for (int ix = ix_begin; ix <= ix_end; ++ix) {
-            int index = gpg::index(iz, ix, padded_nx);
-
-            numerator += std::conj(ray_action[index]) * rhs[index];
-            denominator += std::norm(ray_action[index]);
-        }
-    }
-
-    if (denominator <= std::numeric_limits<double>::epsilon()) {
-        throw std::runtime_error(
-            "cannot calculate the ray-field normalization factor");
-    }
-
-    return numerator / denominator;
-}
-
-
-/*
- * 构造 shifted-Helmholtz 预条件矩阵
- *
- *     M = A + i*beta*k^2.
- *
- * 附加的复数偏移增强了阻尼，可以提高 Helmholtz 矩阵进行 ILUT
- * 分解时的稳定性。M 只作为预条件器使用，真实残差始终用原始
- * Helmholtz 矩阵 A 计算。
- */
-static Sparse build_shifted_helmholtz(
-    const Sparse& helmholtz,
-    const std::vector<float>& velocity,
-    int nz,
-    int nx,
-    float frequency,
-    float shift_beta)
-{
-    Sparse shifted_helmholtz = helmholtz;
-    double omega = 2.0 * PI * frequency;
-
-    for (int iz = 0; iz < nz; ++iz) {
-        for (int ix = 0; ix < nx; ++ix) {
-            int index = gpg::index(iz, ix, nx);
-            double velocity_value = std::max(
-                static_cast<double>(
-                    velocity[static_cast<std::size_t>(index)]),
-                std::numeric_limits<double>::epsilon());
-            double wavenumber = omega / velocity_value;
-            double k2 = wavenumber * wavenumber;
-
-            shifted_helmholtz.coeffRef(index, index) +=
-                Complex(0.0, shift_beta * k2);
-        }
-    }
-
-    shifted_helmholtz.makeCompressed();
-    return shifted_helmholtz;
-}
-
-
-/* 从带吸收层的计算区域中截取原始物理模型区域。 */
-static std::vector<se::huygens::Complex> crop_wavefield(
-    const Vector& padded_wavefield,
-    const se::huygens::Model2D& model)
-{
-    int pml = gpg::kPml;
-    int padded_nx = model.nx + 2 * pml;
-
-    std::vector<se::huygens::Complex> physical_wavefield(
-        static_cast<std::size_t>(model.nz) * model.nx);
-
-    for (int iz = 0; iz < model.nz; ++iz) {
-        for (int ix = 0; ix < model.nx; ++ix) {
-            int padded_index =
-                gpg::index(iz + pml, ix + pml, padded_nx);
-            Complex value = padded_wavefield[padded_index];
-
-            physical_wavefield[model.index(ix, iz)] =
-                se::huygens::Complex(
-                    static_cast<float>(value.real()),
-                    static_cast<float>(value.imag()));
-        }
-    }
-
-    return physical_wavefield;
-}
-
-
-/*
- * 输出某次迭代的复数波场。
- *
- * 例如 field_name="iter"、iteration=2 时输出：
- *
- *     PREFIX_iter_002_real.rsf
- *     PREFIX_iter_002_imag.rsf
- */
-static void write_wavefield(
-    const char* output_prefix,
-    const char* field_name,
-    int iteration,
+static void commit_block_output(
     const se::huygens::Model2D& model,
-    const Vector& padded_wavefield,
-    float frequency,
-    const char* method)
+    const se::huygens::Block& block,
+    const std::vector<Complex>& local_wavefield,
+    std::vector<Complex>& global_wavefield)
 {
-    char real_file[4096];
-    char imag_file[4096];
-
-    std::snprintf(
-        real_file,
-        sizeof(real_file),
-        "%s_%s_%03d_real.rsf",
-        output_prefix,
-        field_name,
-        iteration);
-    std::snprintf(
-        imag_file,
-        sizeof(imag_file),
-        "%s_%s_%03d_imag.rsf",
-        output_prefix,
-        field_name,
-        iteration);
-
-    std::vector<se::huygens::Complex> physical_wavefield =
-        crop_wavefield(padded_wavefield, model);
-
-    se::huygens::write_wavefield_component_rsf(
-        real_file,
-        model,
-        physical_wavefield,
-        frequency,
-        method,
-        false);
-    se::huygens::write_wavefield_component_rsf(
-        imag_file,
-        model,
-        physical_wavefield,
-        frequency,
-        method,
-        true);
+    const int first = (block.id == 0) ? block.source_iz : block.target_start_iz;
+    for (int iz = first; iz <= block.target_end_iz; ++iz) {
+        for (int ix = 0; ix < model.nx; ++ix) {
+            global_wavefield[model.index(ix, iz)] =
+                local_wavefield[model.index(ix, iz)];
+        }
+    }
 }
 
+static ResidualSummary evaluate_global_residual(
+    const se::huygens::Model2D& model,
+    const se::huygens::BlockInfo& info,
+    const std::vector<Complex>& wavefield,
+    float frequency)
+{
+    const double cx = 1.0 /
+        (static_cast<double>(model.dx) * model.dx);
+    const double cz = 1.0 /
+        (static_cast<double>(model.dz) * model.dz);
+    const double omega = 2.0 * kPi * frequency;
+
+    std::vector<unsigned char> seam_row(static_cast<std::size_t>(model.nz), 0);
+    for (std::size_t iblock = 0; iblock + 1 < info.blocks.size(); ++iblock) {
+        const int seam = info.blocks[iblock].target_end_iz;
+        if (seam >= 1 && seam < model.nz - 1) seam_row[seam] = 1;
+        if (seam + 1 >= 1 && seam + 1 < model.nz - 1) seam_row[seam + 1] = 1;
+    }
+
+    long double total_r2 = 0.0L;
+    long double total_scale2 = 0.0L;
+    long double bulk_r2 = 0.0L;
+    long double seam_r2 = 0.0L;
+    std::size_t bulk_count = 0;
+    std::size_t seam_count = 0;
+
+    for (int iz = 1; iz < model.nz - 1; ++iz) {
+        for (int ix = 1; ix < model.nx - 1; ++ix) {
+            const std::size_t index = model.index(ix, iz);
+            const Complex center = wavefield[index];
+            const double velocity = model.velocity[index];
+            const double k2 = (omega / velocity) * (omega / velocity);
+
+            const Complex residual =
+                static_cast<float>(cx) *
+                    (wavefield[model.index(ix - 1, iz)] - 2.0f * center +
+                     wavefield[model.index(ix + 1, iz)]) +
+                static_cast<float>(cz) *
+                    (wavefield[model.index(ix, iz - 1)] - 2.0f * center +
+                     wavefield[model.index(ix, iz + 1)]) +
+                static_cast<float>(k2) * center;
+
+            const long double r2 = static_cast<long double>(std::norm(residual));
+            const long double scale2 = static_cast<long double>(
+                std::norm(static_cast<float>(k2) * center));
+            total_r2 += r2;
+            total_scale2 += scale2;
+
+            if (seam_row[static_cast<std::size_t>(iz)] != 0) {
+                seam_r2 += r2;
+                ++seam_count;
+            } else {
+                bulk_r2 += r2;
+                ++bulk_count;
+            }
+        }
+    }
+
+    ResidualSummary result;
+    result.relative_residual = std::sqrt(
+        static_cast<double>(total_r2 /
+            std::max(total_scale2, static_cast<long double>(1.0e-30))));
+    result.bulk_rms = std::sqrt(
+        static_cast<double>(bulk_r2 /
+            std::max<std::size_t>(bulk_count, 1)));
+    result.seam_rms = std::sqrt(
+        static_cast<double>(seam_r2 /
+            std::max<std::size_t>(seam_count, 1)));
+    result.seam_to_bulk = result.seam_rms /
+        std::max(result.bulk_rms, std::numeric_limits<double>::min());
+    return result;
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
-    FILE* metrics_file = NULL;
-
-    /*
-     * 与 src 中其他程序保持一致：首先初始化项目自带的参数系统，
-     * 后续通过 se_have_par() 和 se_get_par_*() 读取 key=value 参数。
-     */
     se_par_init(argc, argv);
 
     try {
-        if (have_help_argument(argc, argv)) {
+        if (help_requested(argc, argv)) {
             print_help(argv[0]);
             return 0;
         }
 
-        /* -------------------- 1. 读取命令行参数 -------------------- */
+        if (!se_have_par("velocity")) {
+            ERROR(("Need velocity= RSF model"));
+        }
+        if (!se_have_par("block_file")) {
+            ERROR(("Need block_file= block_info.dat"));
+        }
+        if (!se_have_par("table_prefix")) {
+            ERROR(("Need table_prefix= precomputed traveltime prefix"));
+        }
 
-        const char* velocity_file = se_have_par("velocity")
-            ? se_get_par_str("velocity")
-            : "model/vmar.rsf";
-        const char* output_prefix = se_have_par("output_prefix")
-            ? se_get_par_str("output_prefix")
-            : "output/ray_helmholtz";
-        const char* preconditioner = se_have_par("preconditioner")
-            ? se_get_par_str("preconditioner")
-            : "ilut";
+        const std::string velocity = se_get_par_str("velocity");
+        const std::string block_file = se_get_par_str("block_file");
+        const std::string table_prefix = se_get_par_str("table_prefix");
+        const std::string output_prefix = se_have_par("output_prefix")
+            ? std::string(se_get_par_str("output_prefix"))
+            : std::string("output/ray_helmholtz_iteration");
 
-        float frequency = se_have_par("frequency")
-            ? se_get_par_float("frequency") : 15.0f;
-        float source_amplitude = se_have_par("source_amplitude")
-            ? se_get_par_float("source_amplitude") : 1.0f;
-        float tolerance = se_have_par("tolerance")
-            ? se_get_par_float("tolerance") : 1.0e-3f;
-        float shift_beta = se_have_par("shift_beta")
-            ? se_get_par_float("shift_beta") : 0.10f;
-        float ilut_drop_tolerance = se_have_par("ilut_drop_tolerance")
-            ? se_get_par_float("ilut_drop_tolerance") : 1.0e-2f;
-
-        int source_ix = se_have_par("source_ix")
+        const float frequency = se_have_par("frequency")
+            ? se_get_par_float("frequency") : 25.0f;
+        const int source_ix_parameter = se_have_par("source_ix")
             ? se_get_par_int("source_ix") : -1;
-        int source_iz = se_have_par("source_iz")
-            ? se_get_par_int("source_iz") : 1;
-        int max_iterations = se_have_par("max_iterations")
-            ? se_get_par_int("max_iterations") : 8;
-        int scale_radius = se_have_par("scale_radius")
-            ? se_get_par_int("scale_radius") : 4;
-        int ilut_fill_factor = se_have_par("ilut_fill_factor")
-            ? se_get_par_int("ilut_fill_factor") : 10;
-        int write_correction = se_have_par("write_correction")
-            ? se_get_par_int("write_correction") : 1;
+        const int source_iz = se_have_par("source_iz")
+            ? se_get_par_int("source_iz") : 0;
+        const float source_amplitude = se_have_par("source_amplitude")
+            ? se_get_par_float("source_amplitude") : 1.0f;
+        const float source_radius = se_have_par("source_radius")
+            ? se_get_par_float("source_radius") : 0.0f;
 
-        /* 后续判断使用整数标志，避免在循环中反复比较字符串。 */
-        int use_ilut = std::strcmp(preconditioner, "ilut") == 0;
-        int use_diagonal =
-            std::strcmp(preconditioner, "diagonal") == 0;
-        int use_identity =
-            std::strcmp(preconditioner, "identity") == 0;
+        const float filter_dt = se_have_par("filter_dt")
+            ? se_get_par_float("filter_dt") : 0.001f;
+        const float filter_length = se_have_par("filter_length")
+            ? se_get_par_float("filter_length") : 0.025f;
+        const int filter_lookup_subsamples =
+            se_have_par("filter_lookup_subsamples")
+            ? se_get_par_int("filter_lookup_subsamples") : 64;
 
-        if (frequency <= 0.0f || source_amplitude == 0.0f ||
-            tolerance <= 0.0f || shift_beta < 0.0f ||
-            ilut_drop_tolerance < 0.0f || ilut_fill_factor < 1 ||
-            max_iterations < 1 || scale_radius < 0) {
-            throw std::runtime_error("invalid command-line parameter");
+        const int bf_p = se_have_par("bf_p")
+            ? se_get_par_int("bf_p") : 12;
+        const int bf_leaf = se_have_par("bf_n_leaf")
+            ? se_get_par_int("bf_n_leaf") : 16;
+        const int bf_panel_levels = se_have_par("bf_panel_levels")
+            ? se_get_par_int("bf_panel_levels") : 1;
+        const float bf_amp_eps = se_have_par("bf_amp_eps")
+            ? se_get_par_float("bf_amp_eps") : 1.0e-20f;
+        const float bf_phase_tol = se_have_par("bf_phase_tol")
+            ? se_get_par_float("bf_phase_tol") : 1.0f;
+
+        const int iteration_cycles = se_have_par("iter_cycles")
+            ? se_get_par_int("iter_cycles") : 3;
+        const int iteration_count = se_have_par("iter_iterations")
+            ? se_get_par_int("iter_iterations") : 10;
+        const int iteration_restart = se_have_par("iter_restart")
+            ? se_get_par_int("iter_restart") : 10;
+        const double iteration_tolerance = se_have_par("iter_tolerance")
+            ? static_cast<double>(se_get_par_float("iter_tolerance")) : 1.0e-4;
+        const std::string preconditioner_text =
+            se_have_par("iter_preconditioner")
+            ? std::string(se_get_par_str("iter_preconditioner"))
+            : std::string("diagonal");
+        const double ilut_drop_tolerance =
+            se_have_par("iter_ilut_drop_tolerance")
+            ? static_cast<double>(se_get_par_float("iter_ilut_drop_tolerance"))
+            : 1.0e-3;
+        const int ilut_fill_factor = se_have_par("iter_ilut_fill_factor")
+            ? se_get_par_int("iter_ilut_fill_factor") : 10;
+        const double requested_relaxation = se_have_par("iter_relaxation")
+            ? static_cast<double>(se_get_par_float("iter_relaxation")) : -1.0;
+        const double maximum_relaxation = se_have_par("iter_max_relaxation")
+            ? static_cast<double>(se_get_par_float("iter_max_relaxation")) : 1.0;
+
+        const int write_interfaces = se_have_par("write_interfaces")
+            ? se_get_par_int("write_interfaces") : 1;
+        const int write_each_block = se_have_par("write_each_block")
+            ? se_get_par_int("write_each_block") : 0;
+        const int threads = se_have_par("threads")
+            ? se_get_par_int("threads") : 0;
+
+        if (!(frequency > 0.0f) || !(filter_dt > 0.0f) ||
+            !(filter_length > 0.0f) || filter_lookup_subsamples < 1 ||
+            bf_p < 2 || bf_leaf < 4 || bf_p >= bf_leaf ||
+            bf_panel_levels < 0 || bf_amp_eps < 0.0f || !(bf_phase_tol > 0.0f) ||
+            iteration_cycles < 1 || iteration_count < 1 || iteration_restart < 1 ||
+            !(iteration_tolerance > 0.0) || ilut_drop_tolerance < 0.0 ||
+            ilut_fill_factor < 1 || maximum_relaxation < 0.0 ||
+            requested_relaxation > maximum_relaxation) {
+            throw std::invalid_argument("invalid butterfly/iteration parameters");
         }
 
-        if (!use_ilut && !use_diagonal && !use_identity) {
-            throw std::runtime_error(
-                "preconditioner must be ilut, diagonal, or identity");
+        set_threads(threads);
+
+        const se::huygens::Model2D model =
+            se::huygens::read_velocity_model(velocity);
+        const se::huygens::BlockInfo info =
+            se::huygens::read_block_info(block_file);
+        se::huygens::validate_block_info(info, &model);
+
+        if (source_iz != 0) {
+            throw std::invalid_argument(
+                "this prototype currently requires source_iz=0");
+        }
+        if (info.overlap_rows < 1) {
+            std::cerr
+                << "WARNING: overlap_rows=0. The program will run, but the next "
+                   "datum cannot reuse a corrected row inside the previous block.\n";
         }
 
-        /* -------------------- 2. 读取RSF速度模型 -------------------- */
-
-        se::huygens::Model2D model =
-            se::huygens::read_velocity_model(velocity_file);
-
-        /* source_ix=-1 时将震源放在模型横向中心。 */
-        if (source_ix < 0) source_ix = model.nx / 2;
-
-        if (source_ix < 0 || source_ix >= model.nx ||
-            source_iz < 0 || source_iz >= model.nz) {
-            throw std::runtime_error(
-                "source index is outside the velocity model");
+        const int source_ix = source_ix_parameter >= 0
+            ? source_ix_parameter : model.nx / 2;
+        if (source_ix < 0 || source_ix >= model.nx) {
+            throw std::invalid_argument("source_ix is outside model");
         }
 
-        std::printf(
-            "model: nz=%d nx=%d dz=%g dx=%g\n",
-            model.nz,
-            model.nx,
-            model.dz,
-            model.dx);
-        std::printf(
-            "source: iz=%d ix=%d frequency=%g Hz\n",
-            source_iz,
-            source_ix,
-            frequency);
+        se::eigen::SolverOptions solver_options;
+        solver_options.max_iterations = iteration_count;
+        solver_options.tolerance = iteration_tolerance;
+        solver_options.restart = iteration_restart;
+        solver_options.preconditioner =
+            se::eigen::preconditioner_from_string(preconditioner_text);
+        solver_options.ilut_drop_tolerance = ilut_drop_tolerance;
+        solver_options.ilut_fill_factor = ilut_fill_factor;
 
-        /* -------------------- 3. 计算并输出首波走时 -------------------- */
+        std::vector<Complex> wavefield;
+        se::huygens::initialize_first_block_hankel_one_way(
+            model, info, frequency, source_ix, source_iz,
+            source_amplitude, source_radius, wavefield);
 
-        Clock::time_point fmm_start = Clock::now();
+        se::huygens::ensure_parent_directory(output_prefix + "_metrics.csv");
+        std::ofstream metrics(output_prefix + "_metrics.csv");
+        if (!metrics) {
+            throw std::runtime_error("cannot create metrics CSV");
+        }
+        metrics << std::setprecision(12)
+                << "block_id,cycle,source_iz,target_start_iz,target_end_iz,unknowns,"
+                   "bf_build_seconds,bf_apply_seconds,helmholtz_build_seconds,"
+                   "correction_seconds,real_iterations,imag_iterations,"
+                   "real_status,imag_status,residual_before,residual_after,"
+                   "residual_ratio,relative_update,relaxation\n";
 
-        std::vector<float> traveltime =
-            se::huygens::solve_fmm(model, source_ix, source_iz);
+        const float omega =
+            2.0f * static_cast<float>(kPi) * frequency;
 
-        double fmm_seconds = elapsed_seconds(fmm_start);
+        std::cout
+            << "Interface-Butterfly + block Helmholtz iteration\n"
+            << "frequency=" << frequency << " Hz, blocks=" << info.blocks.size()
+            << ", overlap_rows=" << info.overlap_rows << '\n'
+            << "BF: p=" << bf_p << ", leaf=" << bf_leaf
+            << ", phase_tol=" << bf_phase_tol << '\n'
+            << "Local GMRES: cycles=" << iteration_cycles
+            << ", max_iter/cycle=" << iteration_count
+            << ", restart=" << iteration_restart
+            << ", tol=" << iteration_tolerance
+            << ", preconditioner="
+            << se::eigen::to_string(solver_options.preconditioner) << '\n';
 
-        char traveltime_file[4096];
-        std::snprintf(
-            traveltime_file,
-            sizeof(traveltime_file),
-            "%s_traveltime.rsf",
-            output_prefix);
+        for (const se::huygens::Block& block : info.blocks) {
+            const se::huygens::LayerGeometry geometry =
+                se::huygens::make_layer_geometry(model, block, 1, 1, 1);
+            const se::huygens::OneWayLayerTables tables =
+                se::huygens::read_one_way_layer_tables(table_prefix, block.id);
+            se::huygens::validate_one_way_layer_tables(tables, geometry, block);
 
-        se::huygens::write_image_rsf(
-            traveltime_file,
-            model,
-            traveltime,
-            "efmm_first_arrival_traveltime",
-            {{"source_ix", static_cast<float>(source_ix)},
-             {"source_iz", static_cast<float>(source_iz)}});
+            const float maximum_tau = *std::max_element(
+                tables.traveltime.values.begin(), tables.traveltime.values.end());
+            const se::huygens::FrequencyKirchhoffFilter filter(
+                frequency, filter_dt, filter_length,
+                maximum_tau, filter_lookup_subsamples);
 
-        /* -------------------- 4. 构造全局Helmholtz系统 -------------------- */
+            const std::vector<Complex> top_trace =
+                gather_row(model, wavefield, block.source_iz);
 
-        int padded_nz = model.nz + 2 * gpg::kPml;
-        int padded_nx = model.nx + 2 * gpg::kPml;
-        int padded_source_iz = source_iz + gpg::kPml;
-        int padded_source_ix = source_ix + gpg::kPml;
+            const auto bf_build_started = Clock::now();
+            FactorPointer factor = build_bottom_interface_factor(
+                model, block, geometry, tables, filter, omega,
+                bf_p, bf_leaf, bf_panel_levels, bf_amp_eps, bf_phase_tol);
+            const double bf_build_seconds = elapsed_seconds(bf_build_started);
 
-        std::vector<float> padded_velocity = pad_velocity(model);
+            const auto bf_apply_started = Clock::now();
+            const std::vector<Complex> bottom_trace =
+                apply_bottom_interface_factor(factor.get(), top_trace);
+            const double bf_apply_seconds = elapsed_seconds(bf_apply_started);
+            factor.reset();
 
-        Clock::time_point matrix_start = Clock::now();
+            std::vector<Complex> local_wavefield = wavefield;
+            inject_row(model, local_wavefield, block.source_iz, top_trace);
+            inject_row(model, local_wavefield, block.target_end_iz, bottom_trace);
+            initialize_block_guess(
+                model, block, wavefield, local_wavefield);
 
-        /*
-         * 复用 global_preconditioned_gmres.hpp 中的 FD8 Helmholtz
-         * 离散算子。此处只复用矩阵构造，不调用其中的 GMRES。
-         */
-        Sparse helmholtz = gpg::build_helmholtz(
-            padded_velocity,
-            padded_nz,
-            padded_nx,
-            model.dz,
-            model.dx,
-            frequency,
-            false);
+            const auto matrix_started = Clock::now();
+            const LocalHelmholtzSystem local_system =
+                build_local_system(model, block, frequency);
+            const double matrix_seconds = elapsed_seconds(matrix_started);
 
-        double matrix_seconds = elapsed_seconds(matrix_start);
+            std::cout
+                << "Block " << block.id
+                << ": top=" << block.source_iz
+                << ", output=[" << block.target_start_iz
+                << ',' << block.target_end_iz << ']'
+                << ", unknowns=" << local_system.unknowns()
+                << ", BF(build/apply)=" << bf_build_seconds
+                << '/' << bf_apply_seconds << " s\n";
 
-        /* 离散点源右端项，震源位于扩展后计算区域中的对应位置。 */
-        Vector rhs = Vector::Zero(helmholtz.rows());
-        int source_index =
-            gpg::index(padded_source_iz, padded_source_ix, padded_nx);
-        rhs[source_index] = source_amplitude /
-            (static_cast<double>(model.dx) * model.dz);
+            double first_residual = -1.0;
+            for (int cycle = 0; cycle < iteration_cycles; ++cycle) {
+                const auto correction_started = Clock::now();
+                const CorrectionMetrics correction = correct_local_block(
+                    model, local_system, local_wavefield,
+                    solver_options,
+                    requested_relaxation,
+                    maximum_relaxation);
+                const double correction_seconds =
+                    elapsed_seconds(correction_started);
 
-        /* -------------------- 5. 构造并归一化射线初场 -------------------- */
+                if (cycle == 0) first_residual = correction.residual_before;
 
-        Vector physical_ray_wavefield = build_ray_wavefield(
-            model,
-            traveltime,
-            frequency,
-            source_amplitude,
-            source_ix,
-            source_iz);
+                metrics << block.id << ','
+                        << cycle << ','
+                        << block.source_iz << ','
+                        << block.target_start_iz << ','
+                        << block.target_end_iz << ','
+                        << local_system.unknowns() << ','
+                        << bf_build_seconds << ','
+                        << bf_apply_seconds << ','
+                        << matrix_seconds << ','
+                        << correction_seconds << ','
+                        << correction.real_iterations << ','
+                        << correction.imag_iterations << ','
+                        << se::eigen::to_string(correction.real_status) << ','
+                        << se::eigen::to_string(correction.imag_status) << ','
+                        << correction.residual_before << ','
+                        << correction.residual_after << ','
+                        << correction.residual_ratio << ','
+                        << correction.relative_update << ','
+                        << correction.relaxation << '\n';
 
-        Vector initial_wavefield =
-            pad_wavefield(physical_ray_wavefield, model);
+                std::cout
+                    << "  cycle " << cycle
+                    << ": residual " << correction.residual_before
+                    << " -> " << correction.residual_after
+                    << ", ratio=" << correction.residual_ratio
+                    << ", alpha=" << correction.relaxation
+                    << ", GMRES=" << correction.real_iterations
+                    << '/' << correction.imag_iterations << '\n';
 
-        Vector ray_action = helmholtz * initial_wavefield;
-
-        Complex ray_scale = calculate_ray_scale(
-            ray_action,
-            rhs,
-            padded_nz,
-            padded_nx,
-            padded_source_iz,
-            padded_source_ix,
-            scale_radius);
-
-        initial_wavefield *= ray_scale;
-
-        /* 第0次结果就是经过复数尺度匹配后的射线初场。 */
-        Vector wavefield = initial_wavefield;
-
-        write_wavefield(
-            output_prefix,
-            "iter",
-            0,
-            model,
-            wavefield,
-            frequency,
-            "fmm_ray_initial_wavefield");
-
-        /* 使用原始Helmholtz矩阵计算真实残差。 */
-        Vector residual = rhs - helmholtz * wavefield;
-        double rhs_norm = std::max(
-            rhs.norm(), std::numeric_limits<double>::epsilon());
-        double relative_residual = residual.norm() / rhs_norm;
-
-        /* -------------------- 6. 构造所选择的预条件器 -------------------- */
-
-        Clock::time_point preconditioner_start = Clock::now();
-
-        Eigen::IncompleteLUT<Complex, int> ilut;
-        Vector diagonal;
-
-        /*
-         * ILUT 和对角预条件都基于 shifted-Helmholtz 矩阵。
-         * identity 不需要构造 shifted 矩阵，也没有额外的准备开销。
-         */
-        if (use_ilut || use_diagonal) {
-            Sparse shifted_helmholtz = build_shifted_helmholtz(
-                helmholtz,
-                padded_velocity,
-                padded_nz,
-                padded_nx,
-                frequency,
-                shift_beta);
-
-            if (use_ilut) {
-                ilut.setDroptol(ilut_drop_tolerance);
-                ilut.setFillfactor(ilut_fill_factor);
-                ilut.compute(shifted_helmholtz);
-
-                if (ilut.info() != Eigen::Success) {
-                    throw std::runtime_error(
-                        "ILUT construction failed; try increasing "
-                        "shift_beta or use preconditioner=diagonal");
-                }
+                const double target = iteration_tolerance *
+                    std::max(first_residual, std::numeric_limits<double>::min());
+                if (correction.residual_after <= target) break;
             }
-            else {
-                /* Jacobi 预条件：只保存 shifted 矩阵的主对角线。 */
-                diagonal.resize(shifted_helmholtz.rows());
 
-                for (Eigen::Index row = 0;
-                     row < shifted_helmholtz.rows();
-                     ++row) {
-                    diagonal[row] =
-                        shifted_helmholtz.coeff(row, row);
+            commit_block_output(
+                model, block, local_wavefield, wavefield);
 
-                    if (std::abs(diagonal[row]) <=
-                        std::numeric_limits<double>::epsilon()) {
-                        throw std::runtime_error(
-                            "zero diagonal in Jacobi preconditioner");
-                    }
-                }
+            if (write_interfaces != 0) {
+                write_trace_component_rsf(
+                    block_trace_filename(
+                        output_prefix, block.id, "top", "real"),
+                    model, top_trace, frequency,
+                    block.id, block.source_iz, "top", false);
+                write_trace_component_rsf(
+                    block_trace_filename(
+                        output_prefix, block.id, "top", "imag"),
+                    model, top_trace, frequency,
+                    block.id, block.source_iz, "top", true);
+                write_trace_component_rsf(
+                    block_trace_filename(
+                        output_prefix, block.id, "bottom_bf", "real"),
+                    model, bottom_trace, frequency,
+                    block.id, block.target_end_iz, "bottom_bf", false);
+                write_trace_component_rsf(
+                    block_trace_filename(
+                        output_prefix, block.id, "bottom_bf", "imag"),
+                    model, bottom_trace, frequency,
+                    block.id, block.target_end_iz, "bottom_bf", true);
+            }
+
+            if (write_each_block != 0) {
+                se::huygens::write_wavefield_component_rsf(
+                    block_field_filename(output_prefix, block.id, "real"),
+                    model, wavefield, frequency,
+                    "interface_butterfly_block_helmholtz", false);
+                se::huygens::write_wavefield_component_rsf(
+                    block_field_filename(output_prefix, block.id, "imag"),
+                    model, wavefield, frequency,
+                    "interface_butterfly_block_helmholtz", true);
             }
         }
 
-        double preconditioner_seconds =
-            elapsed_seconds(preconditioner_start);
+        metrics.close();
 
-        /* -------------------- 7. 建立收敛信息文件 -------------------- */
+        se::huygens::write_wavefield_component_rsf(
+            output_prefix + "_real.rsf",
+            model, wavefield, frequency,
+            "interface_butterfly_block_helmholtz", false);
+        se::huygens::write_wavefield_component_rsf(
+            output_prefix + "_imag.rsf",
+            model, wavefield, frequency,
+            "interface_butterfly_block_helmholtz", true);
 
-        char metrics_name[4096];
-        std::snprintf(
-            metrics_name,
-            sizeof(metrics_name),
-            "%s_metrics.csv",
-            output_prefix);
+        const ResidualSummary residual = evaluate_global_residual(
+            model, info, wavefield, frequency);
 
-        se::huygens::ensure_parent_directory(metrics_name);
-
-        metrics_file = std::fopen(metrics_name, "w");
-        if (metrics_file == NULL) {
-            throw std::runtime_error("cannot create metrics CSV file");
+        std::ofstream summary(output_prefix + "_summary.txt");
+        if (summary) {
+            summary << std::setprecision(12)
+                    << "relative_helmholtz_residual "
+                    << residual.relative_residual << '\n'
+                    << "bulk_residual_rms " << residual.bulk_rms << '\n'
+                    << "seam_residual_rms " << residual.seam_rms << '\n'
+                    << "seam_to_bulk " << residual.seam_to_bulk << '\n';
         }
 
-        std::fprintf(
-            metrics_file,
-            "iteration,relative_residual,residual_ratio,"
-            "relative_correction,alpha_real,alpha_imag,seconds\n");
-        std::fprintf(
-            metrics_file,
-            "0,%.12e,1.0,0.0,0.0,0.0,0.0\n",
-            relative_residual);
-        std::fflush(metrics_file);
-
-        std::printf("FMM time: %.6f s\n", fmm_seconds);
-        std::printf(
-            "Helmholtz matrix: unknowns=%lld nnz=%lld time=%.6f s\n",
-            static_cast<long long>(helmholtz.rows()),
-            static_cast<long long>(helmholtz.nonZeros()),
-            matrix_seconds);
-        std::printf(
-            "ray scale: %.6e %+.6ei\n",
-            ray_scale.real(),
-            ray_scale.imag());
-        std::printf(
-            "preconditioner: %s, setup time: %.6f s\n",
-            preconditioner,
-            preconditioner_seconds);
-        std::printf(
-            "iteration 0: relative residual=%.6e\n",
-            relative_residual);
-
-        /* -------------------- 8. 开始残差校正迭代 -------------------- */
-
-        /*
-         * 每次迭代执行：
-         *
-         *     z       = M^{-1} r
-         *     w       = A z
-         *     alpha   = w^H r / w^H w
-         *     u       = u + alpha*z
-         *     r       = b - A u
-         *
-         * 其中 alpha 是当前校正方向上的最优复数步长，可使本次更新后
-         * 的二范数残差最小。它比固定松弛因子更适合量级尚不完全一致
-         * 的射线初场。
-         */
-        Clock::time_point iteration_start = Clock::now();
-
-        for (int iteration = 1;
-             iteration <= max_iterations &&
-             relative_residual > tolerance;
-             ++iteration) {
-
-            Vector direction;
-
-            if (use_ilut) {
-                /* z=M^{-1}r：使用 shifted-Helmholtz ILUT。 */
-                direction = ilut.solve(residual);
-
-                if (ilut.info() != Eigen::Success) {
-                    throw std::runtime_error(
-                        "ILUT triangular solve failed");
-                }
-            }
-            else if (use_diagonal) {
-                /* Jacobi 预条件，每个网格点只进行一次复数除法。 */
-                direction = residual.array() / diagonal.array();
-            }
-            else {
-                /* identity：不使用预条件器，直接采用残差方向。 */
-                direction = residual;
-            }
-
-            /* 计算校正方向经过真实Helmholtz算子后的结果。 */
-            Vector action = helmholtz * direction;
-            double denominator = action.squaredNorm();
-
-            if (denominator <= std::numeric_limits<double>::epsilon()) {
-                std::printf(
-                    "iteration stopped: correction direction vanished\n");
-                break;
-            }
-
-            /* 当前方向上的最优复数步长。 */
-            Complex alpha = action.dot(residual) / denominator;
-
-            /* 更新总波场，并重新计算真实残差，避免递推残差累积误差。 */
-            wavefield += alpha * direction;
-            residual = rhs - helmholtz * wavefield;
-
-            double previous_residual = relative_residual;
-            relative_residual = residual.norm() / rhs_norm;
-            double residual_ratio = relative_residual /
-                std::max(
-                    previous_residual,
-                    std::numeric_limits<double>::epsilon());
-
-            /*
-             * 累计校正量与射线初场的比值。该值仅用于诊断，不会限制
-             * 或缩放实际校正量。
-             */
-            Vector correction = wavefield - initial_wavefield;
-            double relative_correction = correction.norm() /
-                std::max(
-                    initial_wavefield.norm(),
-                    std::numeric_limits<double>::epsilon());
-            double iteration_seconds = elapsed_seconds(iteration_start);
-
-            /* 保存本次迭代后的完整总波场。 */
-            write_wavefield(
-                output_prefix,
-                "iter",
-                iteration,
-                model,
-                wavefield,
-                frequency,
-                "ray_initialized_minimum_residual_iteration");
-
-            /*
-             * 单独保存累计校正场。多路径通常弱于首波，因此观察
-             * correction 文件往往比直接观察总场更清楚。
-             */
-            if (write_correction != 0) {
-                write_wavefield(
-                    output_prefix,
-                    "correction",
-                    iteration,
-                    model,
-                    correction,
-                    frequency,
-                    "cumulative_helmholtz_correction");
-            }
-
-            std::fprintf(
-                metrics_file,
-                "%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
-                iteration,
-                relative_residual,
-                residual_ratio,
-                relative_correction,
-                alpha.real(),
-                alpha.imag(),
-                iteration_seconds);
-            std::fflush(metrics_file);
-
-            std::printf(
-                "iteration %d: residual=%.6e ratio=%.6e "
-                "correction/ray=%.6e alpha=%.6e%+.6ei\n",
-                iteration,
-                relative_residual,
-                residual_ratio,
-                relative_correction,
-                alpha.real(),
-                alpha.imag());
-        }
-
-        std::fclose(metrics_file);
-        metrics_file = NULL;
-
-        std::printf(
-            "finished: final relative residual=%.6e\n",
-            relative_residual);
-        std::printf(
-            "traveltime: %s_traveltime.rsf\n",
-            output_prefix);
-        std::printf(
-            "wavefields: %s_iter_NNN_real.rsf / imag.rsf\n",
-            output_prefix);
-        std::printf("metrics: %s\n", metrics_name);
+        std::cout
+            << "Completed.\n"
+            << "  output: " << output_prefix << "_real.rsf / _imag.rsf\n"
+            << "  relative Helmholtz residual = "
+            << residual.relative_residual << '\n'
+            << "  seam/bulk residual ratio = "
+            << residual.seam_to_bulk << '\n'
+            << "  metrics: " << output_prefix << "_metrics.csv\n";
 
         return 0;
-    }
-    catch (const std::exception& error) {
-        if (metrics_file != NULL) {
-            std::fclose(metrics_file);
-        }
-
-        std::fprintf(
-            stderr,
-            "ray_helmholtz_iteration: %s\n",
-            error.what());
-
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "ray_helmholtz_iteration: %s\n", error.what());
         return 1;
     }
 }
