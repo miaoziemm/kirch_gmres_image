@@ -56,7 +56,7 @@ target_link_libraries(
 
 
 # ============================================================
-# Ray-initialized global Helmholtz iteration
+# Native ButterflyPACK interface + block Helmholtz iteration
 # ============================================================
 
 kirch_add_application(
@@ -69,6 +69,9 @@ target_link_libraries(
     PRIVATE
         Kirch::reckirch
         Kirch::selinear
+        Kirch::sefs
+        ButterflyPACK::float
+        OpenMP::OpenMP_CXX
 )
 
 
